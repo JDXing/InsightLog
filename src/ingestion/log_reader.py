@@ -1,23 +1,25 @@
 import time
+import os
 
 LOG_FILE = "/var/log/auth.log"
 
-def follow(file):
-    file.seek(0, 2)
-    while True:
-        line = file.readline()
-        if not line:
-            time.sleep(0.5)
-            continue
-        yield line
+def follow():
+    """
+    Generator function that continuously monitors the auth log
+    and yields new lines in real time.
+    """
 
-def read_logs():
-    try:
-        with open(LOG_FILE, "r") as f:
-            for line in follow(f):
-                print(line.strip())
-    except PermissionError:
-        print("[!] Permission denied. Run VS Code with sudo.")
+    if not os.path.exists(LOG_FILE):
+        raise FileNotFoundError(f"{LOG_FILE} not found.")
 
-if __name__ == "__main__":
-    read_logs()
+    with open(LOG_FILE, "r") as file:
+        file.seek(0, 2)  # Move pointer to end of file
+
+        while True:
+            line = file.readline()
+
+            if not line:
+                time.sleep(0.5)
+                continue
+
+            yield line.strip()
