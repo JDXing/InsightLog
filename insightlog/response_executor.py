@@ -1,50 +1,30 @@
 """
-Human-in-the-Loop Response Executor
-Executes approved actions and logs everything to D3
+InsightLog - Human-in-the-Loop Response Executor
+Executes approved remediation commands and logs to D3
 """
 import subprocess
 import shlex
 import os
-from datetime import datetime
-import db_manager as db
+
+from insightlog import db_manager as db
 
 SAFE_COMMANDS = [
-    "iptables",
-    "ufw",
-    "passwd",
-    "userdel",
-    "usermod",
-    "systemctl",
-    "pkill",
-    "kill",
-    "sshd",
-    "ss",
-    "netstat",
-    "who",
-    "last",
-    "journalctl",
-    "smartctl",
-    "fsck",
-    "free",
-    "vmstat",
-    "fail2ban-client",
+    "iptables", "ufw", "passwd", "userdel", "usermod",
+    "systemctl", "pkill", "kill", "ss", "netstat",
+    "who", "last", "journalctl", "smartctl", "fsck",
+    "free", "vmstat", "fail2ban-client", "sshd",
 ]
 
 
 def is_safe(cmd: str) -> bool:
-    """Check if command starts with a safe allowed binary."""
     parts = shlex.split(cmd)
     if not parts:
         return False
-    binary = os.path.basename(parts[0])
-    return binary in SAFE_COMMANDS
+    return os.path.basename(parts[0]) in SAFE_COMMANDS
 
 
-def execute_action(incident_id: int, command: str, approved_by: str = "operator") -> dict:
-    """
-    Execute a remediation command after human approval.
-    Logs to D3 regardless of success/failure.
-    """
+def execute_action(incident_id: int, command: str,
+                   approved_by: str = "operator") -> dict:
     result_text = ""
     success = 0
 
@@ -52,10 +32,10 @@ def execute_action(incident_id: int, command: str, approved_by: str = "operator"
         return {"success": False, "result": "Empty command."}
 
     if not is_safe(command):
-        result_text = f"BLOCKED: Command '{command}' is not in the safe list."
+        result_text = f"BLOCKED: '{command}' is not in the safe command list."
         db.insert_audit({
             "incident_id": incident_id,
-            "action_type": "blocked_execution",
+            "action_type": "blocked",
             "command":     command,
             "result":      result_text,
             "approved_by": approved_by,
@@ -66,9 +46,7 @@ def execute_action(incident_id: int, command: str, approved_by: str = "operator"
     try:
         proc = subprocess.run(
             shlex.split(command),
-            capture_output=True,
-            text=True,
-            timeout=30
+            capture_output=True, text=True, timeout=30
         )
         result_text = (proc.stdout + proc.stderr).strip()
         success = 1 if proc.returncode == 0 else 0
@@ -85,44 +63,42 @@ def execute_action(incident_id: int, command: str, approved_by: str = "operator"
         "approved_by": approved_by,
         "success":     success,
     })
-
     return {"success": bool(success), "result": result_text}
 
 
 def interactive_execute(incident_id: int, suggestions: list) -> None:
-    """Interactive human-in-the-loop approval and execution loop."""
     print(f"\n[Executor] Suggested actions for Incident #{incident_id}:")
     for i, s in enumerate(suggestions, 1):
         print(f"  {i}. {s}")
     print(f"  {len(suggestions)+1}. Enter custom command")
-    print(f"  0. Skip / Do nothing\n")
+    print(f"  0. Skip\n")
 
     while True:
-        choice = input("Select action number (or 0 to exit): ").strip()
+        choice = input("Select action number (0 to exit): ").strip()
+
         if choice == "0":
             print("[Executor] No action taken.")
             return
 
         if choice.isdigit() and 1 <= int(choice) <= len(suggestions):
             cmd = suggestions[int(choice) - 1]
-            # Extract command from suggestion text
             if ":" in cmd:
                 cmd = cmd.split(":", 1)[1].strip()
         elif choice == str(len(suggestions) + 1):
             cmd = input("Enter command: ").strip()
         else:
-            print("Invalid choice.")
+            print("  Invalid choice.")
             continue
 
-        print(f"\n  Command  : {cmd}")
+        print(f"\n  Command : {cmd}")
         confirm = input("  Approve and execute? [y/N]: ").strip().lower()
         if confirm == "y":
-            print("[Executor] Executing...")
+            print("  Executing...")
             result = execute_action(incident_id, cmd)
-            status = "✓ Success" if result["success"] else "✗ Failed"
+            status = "Success" if result["success"] else "Failed"
             print(f"  {status}: {result['result']}")
-            another = input("\nExecute another action? [y/N]: ").strip().lower()
-            if another != "y":
+            again = input("\n  Execute another action? [y/N]: ").strip().lower()
+            if again != "y":
                 return
         else:
-            print("[Executor] Action cancelled.")
+            print("  Action cancelled.")

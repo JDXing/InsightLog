@@ -8,8 +8,9 @@ setup(
     entry_points={
         "console_scripts": [
             "insightlog=insightlog.cli:main",
+            "insightlog-gui=insightlog.gui:main",
         ],
     },
     python_requires=">=3.8",
-    install_requires=[],  # stdlib only
+    install_requires=[],
 )

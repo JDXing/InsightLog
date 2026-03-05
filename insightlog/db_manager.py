@@ -1,6 +1,7 @@
 """
+InsightLog - Database Manager
 D1 = Log Database
-D2 = Incident Database  
+D2 = Incident Database
 D3 = Audit/Execution Database
 """
 import sqlite3
@@ -39,16 +40,21 @@ def init_d1():
         CREATE INDEX IF NOT EXISTS idx_l_ts   ON logs(timestamp);
         CREATE INDEX IF NOT EXISTS idx_l_type ON logs(log_type);
     """)
-    c.commit(); c.close()
+    c.commit()
+    c.close()
 
 
 def insert_log(log: dict) -> int:
     c = _conn("d1_logs")
     cur = c.execute("""
-        INSERT INTO logs(timestamp,source_file,log_type,raw_line,host,process,pid,message,parsed_data)
-        VALUES(:timestamp,:source_file,:log_type,:raw_line,:host,:process,:pid,:message,:parsed_data)
+        INSERT INTO logs(timestamp,source_file,log_type,raw_line,
+                         host,process,pid,message,parsed_data)
+        VALUES(:timestamp,:source_file,:log_type,:raw_line,
+               :host,:process,:pid,:message,:parsed_data)
     """, {**log, "parsed_data": json.dumps(log.get("parsed_data", {}))})
-    c.commit(); row_id = cur.lastrowid; c.close()
+    c.commit()
+    row_id = cur.lastrowid
+    c.close()
     return row_id
 
 
@@ -56,20 +62,32 @@ def query_logs(filters: dict = None, limit: int = 100) -> list:
     c = _conn("d1_logs")
     q, params, clauses = "SELECT * FROM logs", [], []
     if filters:
-        if "log_type" in filters: clauses.append("log_type=?"); params.append(filters["log_type"])
-        if "since"    in filters: clauses.append("timestamp>=?"); params.append(filters["since"])
-        if "keyword"  in filters: clauses.append("message LIKE ?"); params.append(f"%{filters['keyword']}%")
-        if "process"  in filters: clauses.append("process LIKE ?"); params.append(f"%{filters['process']}%")
-    if clauses: q += " WHERE " + " AND ".join(clauses)
+        if "log_type" in filters:
+            clauses.append("log_type=?")
+            params.append(filters["log_type"])
+        if "since" in filters:
+            clauses.append("timestamp>=?")
+            params.append(filters["since"])
+        if "keyword" in filters:
+            clauses.append("message LIKE ?")
+            params.append(f"%{filters['keyword']}%")
+        if "process" in filters:
+            clauses.append("process LIKE ?")
+            params.append(f"%{filters['process']}%")
+    if clauses:
+        q += " WHERE " + " AND ".join(clauses)
     q += f" ORDER BY timestamp DESC LIMIT {limit}"
-    rows = c.execute(q, params).fetchall(); c.close()
+    rows = c.execute(q, params).fetchall()
+    c.close()
     return [dict(r) for r in rows]
 
 
 def get_log_stats() -> dict:
     c = _conn("d1_logs")
     total = c.execute("SELECT COUNT(*) FROM logs").fetchone()[0]
-    by_type = dict(c.execute("SELECT log_type, COUNT(*) FROM logs GROUP BY log_type").fetchall())
+    by_type = dict(c.execute(
+        "SELECT log_type, COUNT(*) FROM logs GROUP BY log_type"
+    ).fetchall())
     c.close()
     return {"total": total, "by_type": by_type}
 
@@ -95,7 +113,8 @@ def init_d2():
         CREATE INDEX IF NOT EXISTS idx_i_status ON incidents(status);
         CREATE INDEX IF NOT EXISTS idx_i_sev    ON incidents(severity);
     """)
-    c.commit(); c.close()
+    c.commit()
+    c.close()
 
 
 def insert_incident(inc: dict) -> int:
@@ -106,7 +125,9 @@ def insert_incident(inc: dict) -> int:
         VALUES(:log_id,:threat_type,:severity,:description,
                :source_ip,:affected_user,:raw_log,:status)
     """, inc)
-    c.commit(); inc_id = cur.lastrowid; c.close()
+    c.commit()
+    inc_id = cur.lastrowid
+    c.close()
     return inc_id
 
 
@@ -114,13 +135,23 @@ def query_incidents(filters: dict = None, limit: int = 50) -> list:
     c = _conn("d2_incidents")
     q, params, clauses = "SELECT * FROM incidents", [], []
     if filters:
-        if "status"      in filters: clauses.append("status=?"); params.append(filters["status"])
-        if "severity"    in filters: clauses.append("severity=?"); params.append(filters["severity"])
-        if "threat_type" in filters: clauses.append("threat_type LIKE ?"); params.append(f"%{filters['threat_type']}%")
-        if "since"       in filters: clauses.append("detected_at>=?"); params.append(filters["since"])
-    if clauses: q += " WHERE " + " AND ".join(clauses)
+        if "status" in filters:
+            clauses.append("status=?")
+            params.append(filters["status"])
+        if "severity" in filters:
+            clauses.append("severity=?")
+            params.append(filters["severity"])
+        if "threat_type" in filters:
+            clauses.append("threat_type LIKE ?")
+            params.append(f"%{filters['threat_type']}%")
+        if "since" in filters:
+            clauses.append("detected_at>=?")
+            params.append(filters["since"])
+    if clauses:
+        q += " WHERE " + " AND ".join(clauses)
     q += f" ORDER BY detected_at DESC LIMIT {limit}"
-    rows = c.execute(q, params).fetchall(); c.close()
+    rows = c.execute(q, params).fetchall()
+    c.close()
     return [dict(r) for r in rows]
 
 
@@ -128,15 +159,19 @@ def update_incident(inc_id: int, status: str, notes: str = ""):
     c = _conn("d2_incidents")
     c.execute("""
         UPDATE incidents SET status=?, notes=?,
-        resolved_at=CASE WHEN ? IN ('resolved','mitigated') THEN datetime('now') ELSE resolved_at END
+        resolved_at=CASE WHEN ? IN ('resolved','mitigated')
+                    THEN datetime('now') ELSE resolved_at END
         WHERE id=?
     """, (status, notes, status, inc_id))
-    c.commit(); c.close()
+    c.commit()
+    c.close()
 
 
 def get_incident(inc_id: int) -> dict:
     c = _conn("d2_incidents")
-    row = c.execute("SELECT * FROM incidents WHERE id=?", (inc_id,)).fetchone()
+    row = c.execute(
+        "SELECT * FROM incidents WHERE id=?", (inc_id,)
+    ).fetchone()
     c.close()
     return dict(row) if row else {}
 
@@ -156,30 +191,43 @@ def init_d3():
             success     INTEGER DEFAULT 1
         );
     """)
-    c.commit(); c.close()
+    c.commit()
+    c.close()
 
 
 def insert_audit(entry: dict) -> int:
     c = _conn("d3_audit")
     cur = c.execute("""
-        INSERT INTO audit_log(incident_id,action_type,command,result,approved_by,success)
-        VALUES(:incident_id,:action_type,:command,:result,:approved_by,:success)
+        INSERT INTO audit_log(incident_id,action_type,command,
+                              result,approved_by,success)
+        VALUES(:incident_id,:action_type,:command,
+               :result,:approved_by,:success)
     """, entry)
-    c.commit(); aid = cur.lastrowid; c.close()
+    c.commit()
+    aid = cur.lastrowid
+    c.close()
     return aid
 
 
 def query_audit(incident_id: int = None, limit: int = 50) -> list:
     c = _conn("d3_audit")
     if incident_id:
-        rows = c.execute("SELECT * FROM audit_log WHERE incident_id=? ORDER BY executed_at DESC LIMIT ?",
-                         (incident_id, limit)).fetchall()
+        rows = c.execute(
+            "SELECT * FROM audit_log WHERE incident_id=? "
+            "ORDER BY executed_at DESC LIMIT ?",
+            (incident_id, limit)
+        ).fetchall()
     else:
-        rows = c.execute("SELECT * FROM audit_log ORDER BY executed_at DESC LIMIT ?", (limit,)).fetchall()
+        rows = c.execute(
+            "SELECT * FROM audit_log ORDER BY executed_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
     c.close()
     return [dict(r) for r in rows]
 
 
 def init_all():
-    init_d1(); init_d2(); init_d3()
+    init_d1()
+    init_d2()
+    init_d3()
     print("[DB] All databases initialized.")

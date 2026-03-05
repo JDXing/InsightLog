@@ -1,17 +1,17 @@
 """
-Incident Manager
-Manages incident lifecycle, sends terminal alerts, triggers Decision Support
+InsightLog - Incident Manager
+Manages incident lifecycle and sends real-time alerts
 """
 import os
 import subprocess
-import threading
 from datetime import datetime
-from typing import Callable, Optional
-import db_manager as db
-from threat_engine import suggest_actions
+from typing import Callable
+
+from insightlog import db_manager as db
+from insightlog.threat_engine import suggest_actions
 
 ALERT_LOG = "/var/log/insightlog_alerts.log"
-_alert_callbacks = []   # Registered alert handlers
+_alert_callbacks = []
 
 
 def register_alert_handler(fn: Callable):
@@ -19,7 +19,6 @@ def register_alert_handler(fn: Callable):
 
 
 def handle_new_incident(incident: dict):
-    """Called by threat engine when a new incident is created."""
     inc_id   = incident["id"]
     severity = incident["severity"].upper()
     threat   = incident["threat_type"]
@@ -27,51 +26,54 @@ def handle_new_incident(incident: dict):
     ip       = incident.get("source_ip", "")
     user     = incident.get("affected_user", "")
 
-    msg_lines = [
+    lines = [
         f"\n{'='*60}",
-        f" ⚠  INSIGHTLOG ALERT — Incident #{inc_id}",
+        f" INSIGHTLOG ALERT — Incident #{inc_id}",
         f"{'='*60}",
         f"  Severity : {severity}",
         f"  Threat   : {threat}",
         f"  Details  : {desc}",
     ]
-    if ip:   msg_lines.append(f"  Source IP: {ip}")
-    if user: msg_lines.append(f"  User     : {user}")
-    msg_lines += [
+    if ip:   lines.append(f"  Source IP: {ip}")
+    if user: lines.append(f"  User     : {user}")
+    lines += [
         f"  Time     : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"",
-        f"  Run:  insightlog respond --incident {inc_id}",
-        f"  Or :  insightlog chat --incident {inc_id}",
+        f"  Run: insightlog respond --incident {inc_id}",
+        f"  Or : insightlog chat --incident {inc_id}",
         f"{'='*60}\n",
     ]
-    alert_msg = "\n".join(msg_lines)
+    alert_msg = "\n".join(lines)
 
-    # Write to alert log
+    # Write to alert log file
     try:
         with open(ALERT_LOG, "a") as f:
             f.write(alert_msg)
     except Exception:
         pass
 
-    # Print to all terminals (wall message)
+    # Broadcast to all logged-in terminals
     try:
         subprocess.run(["wall", alert_msg], capture_output=True, timeout=3)
     except Exception:
         pass
 
-    # Fire registered callbacks
-    for cb in _alert_callbacks:
-        try: cb(incident)
-        except Exception: pass
-
-    # Desktop notification (if available)
+    # Desktop notification if display is available
     try:
         subprocess.run(
-            ["notify-send", f"InsightLog [{severity}]", f"{threat}\nIncident #{inc_id}"],
+            ["notify-send", f"InsightLog [{severity}]",
+             f"{threat}\nIncident #{inc_id}"],
             capture_output=True, timeout=2
         )
     except Exception:
         pass
+
+    # Fire any registered callbacks
+    for cb in _alert_callbacks:
+        try:
+            cb(incident)
+        except Exception:
+            pass
 
 
 def list_incidents(status: str = "open", limit: int = 20) -> list:

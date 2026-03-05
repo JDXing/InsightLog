@@ -1,25 +1,24 @@
 """
-Rule-based AI Threat Detection Engine
-Uses sliding-time-window counting + severity scoring
+InsightLog - Rule-Based Threat Detection Engine
+Sliding time window + severity scoring
 """
 import json
 import time
 import threading
-from datetime import datetime, timedelta
+from typing import Dict, Tuple
 from collections import defaultdict
-from typing import Optional, Dict, Tuple
-import db_manager as db
 
-# ─── Threat Rules ────────────────────────────────────────────────────────────
+from insightlog import db_manager as db
+
 RULES = [
     {
         "id":          "BRUTE_SSH",
         "name":        "SSH Brute Force",
         "event_type":  "ssh_failed",
-        "threshold":   5,          # occurrences
-        "window_sec":  60,         # in N seconds
+        "threshold":   5,
+        "window_sec":  60,
         "severity":    "critical",
-        "description": "Multiple SSH failed logins detected — possible brute force attack.",
+        "description": "Multiple SSH failed logins — possible brute force attack.",
     },
     {
         "id":          "INVALID_USER",
@@ -96,23 +95,19 @@ RULES = [
 ]
 
 RULE_MAP = {r["event_type"]: r for r in RULES}
-
-# Sliding window counters: {(event_type, key): [(timestamp), ...]}
 _windows: Dict[Tuple, list] = defaultdict(list)
 _lock = threading.Lock()
 
 
 def _window_key(log: dict) -> str:
-    """Group events by source IP or user for window counting."""
-    pd = json.loads(log.get("parsed_data") or "{}")
+    try:
+        pd = json.loads(log.get("parsed_data") or "{}")
+    except Exception:
+        pd = {}
     return pd.get("ip") or pd.get("user") or log.get("host") or "global"
 
 
 def evaluate(log: dict, log_id: int, on_threat=None):
-    """
-    Check a parsed log against all rules using sliding time windows.
-    Calls on_threat(incident_dict) if a rule fires.
-    """
     try:
         pd = json.loads(log.get("parsed_data") or "{}")
     except Exception:
@@ -122,9 +117,9 @@ def evaluate(log: dict, log_id: int, on_threat=None):
     if not event_type or event_type not in RULE_MAP:
         return
 
-    rule = RULE_MAP[event_type]
-    key  = (event_type, _window_key(log))
-    now  = time.time()
+    rule   = RULE_MAP[event_type]
+    key    = (event_type, _window_key(log))
+    now    = time.time()
     cutoff = now - rule["window_sec"]
 
     with _lock:
@@ -133,7 +128,6 @@ def evaluate(log: dict, log_id: int, on_threat=None):
         count = len(_windows[key])
 
     if count >= rule["threshold"]:
-        # Reset window to avoid repeated alerts for same burst
         with _lock:
             _windows[key] = []
 
@@ -149,59 +143,66 @@ def evaluate(log: dict, log_id: int, on_threat=None):
         }
         inc_id = db.insert_incident(incident)
         incident["id"] = inc_id
-        print(f"\n[THREAT] {rule['severity'].upper()} — {rule['name']} (incident #{inc_id})")
+        print(f"\n[THREAT] {rule['severity'].upper()} — "
+              f"{rule['name']} (incident #{inc_id})")
         if on_threat:
             on_threat(incident)
 
 
 def suggest_actions(incident: dict) -> list:
-    """Return a list of suggested remediation actions for a given threat."""
-    t = incident.get("threat_type", "")
+    t    = incident.get("threat_type", "")
     ip   = incident.get("source_ip", "")
     user = incident.get("affected_user", "")
 
     suggestions = {
         "SSH Brute Force": [
-            f"Block IP: iptables -A INPUT -s {ip} -j DROP" if ip else "Block attacking IP with iptables",
-            f"Lock user account: passwd -l {user}" if user else "Audit SSH user accounts",
-            "Review /etc/ssh/sshd_config — disable password auth",
-            "Enable fail2ban for SSH",
+            f"Block IP: iptables -A INPUT -s {ip} -j DROP"
+                if ip else "Block attacking IP with iptables",
+            f"Lock user: passwd -l {user}" if user else "Audit SSH accounts",
+            "Disable password auth in /etc/ssh/sshd_config",
+            "Enable fail2ban: systemctl enable --now fail2ban",
         ],
         "SSH Invalid User Scan": [
-            f"Block IP: iptables -A INPUT -s {ip} -j DROP" if ip else "Block scanning IP",
-            "Enable AllowUsers in sshd_config",
+            f"Block IP: iptables -A INPUT -s {ip} -j DROP"
+                if ip else "Block scanning IP",
+            "Restrict SSH with AllowUsers in sshd_config",
         ],
         "Root Login": [
             "Disable root SSH: set PermitRootLogin no in sshd_config",
-            "Review who logged in as root and why",
             "Enforce sudo usage instead of direct root login",
+            "Review root login source immediately",
         ],
         "Privilege Escalation Failed": [
-            f"Investigate user {user}" if user else "Audit sudoers file",
+            f"Investigate user {user}" if user else "Audit sudoers",
             "Review /etc/sudoers for unnecessary permissions",
         ],
         "Unexpected New User Created": [
-            f"Remove user: userdel -r {user}" if user else "Audit newly created accounts",
+            f"Remove user: userdel -r {user}" if user else "Audit new accounts",
             "Check /etc/passwd for unauthorized accounts",
         ],
         "Password Change": [
-            f"Verify {user} authorized this change" if user else "Audit recent password changes",
+            f"Verify {user} authorized this change"
+                if user else "Audit recent password changes",
             "Check for unauthorized access before change",
         ],
         "Port Scan Detected": [
-            f"Block scanner: iptables -A INPUT -s {ip} -j DROP" if ip else "Identify scan source",
+            f"Block scanner: iptables -A INPUT -s {ip} -j DROP"
+                if ip else "Identify scan source",
             "Review open ports: ss -tlnp",
-            "Enable ufw or nftables rules",
+            "Harden firewall rules with ufw",
         ],
         "Kernel Panic / OOM": [
-            "Check memory: free -h && vmstat",
-            "Review /var/log/kern.log for details",
-            "Consider reboot if system is unstable",
+            "Check memory usage: free -h",
+            "Review kernel log: journalctl -k --since today",
+            "Consider system reboot if unstable",
         ],
         "Disk / IO Error": [
             "Check disk health: smartctl -a /dev/sda",
-            "Run fsck on affected partition",
-            "Review /var/log/kern.log for disk errors",
+            "Run filesystem check: fsck /dev/sda1",
+            "Review kernel log for disk errors",
         ],
     }
-    return suggestions.get(t, ["Investigate logs manually", "Escalate to senior admin"])
+    return suggestions.get(t, [
+        "Investigate logs manually",
+        "Escalate to senior administrator",
+    ])
