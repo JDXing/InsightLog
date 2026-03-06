@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════
+#  InsightLog Installer
+# ═══════════════════════════════════════════════════════════════
 set -e
 
 echo "╔══════════════════════════════════════╗"
@@ -10,90 +13,113 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-INSTALL_DIR="/opt/insightlog"
-VENV_DIR="$INSTALL_DIR/venv"
-SRC_DIR="$(pwd)"
-
-echo "[1/7] Creating install directory..."
-mkdir -p "$INSTALL_DIR"
+# ── Directories ───────────────────────────────────────────────
 mkdir -p /var/lib/insightlog
 mkdir -p /var/log
 chmod 750 /var/lib/insightlog
 
-echo "[2/7] Installing system dependencies..."
-apt install -y python3-tk python3-venv python3-pip 2>/dev/null || true
+# ── System dependencies ───────────────────────────────────────
+echo "[+] Installing system dependencies..."
+apt-get install -y python3-tk zenity --quiet
 
-echo "[3/7] Creating virtual environment..."
-python3 -m venv "$VENV_DIR"
+# ── Python package ────────────────────────────────────────────
+echo "[+] Installing InsightLog Python package..."
+pip3 install -e . --quiet --break-system-packages 2>/dev/null || \
+    pip3 install -e . --quiet
 
-echo "[4/7] Installing package into venv..."
-"$VENV_DIR/bin/pip" install --quiet --upgrade pip
-"$VENV_DIR/bin/pip" install --quiet setuptools
-"$VENV_DIR/bin/pip" install --quiet -e "$SRC_DIR"
+# ── Log file permissions ──────────────────────────────────────
+chmod a+r /var/log/syslog   2>/dev/null || true
+chmod a+r /var/log/auth.log 2>/dev/null || true
 
-echo "[5/7] Setting log file permissions..."
-chmod +r /var/log/syslog   2>/dev/null || true
-chmod +r /var/log/auth.log 2>/dev/null || true
+# ── CLI wrapper ───────────────────────────────────────────────
+cat > /usr/local/bin/insightlog << 'EOF'
+#!/usr/bin/env bash
+exec /opt/insightlog/venv/bin/insightlog "$@" 2>/dev/null || \
+exec python3 -m insightlog.cli "$@"
+EOF
+chmod +x /usr/local/bin/insightlog
 
-echo "[6/7] Creating systemd service..."
+# ── GUI wrapper ───────────────────────────────────────────────
+cat > /usr/local/bin/insightlog-gui << 'EOF'
+#!/usr/bin/env bash
+exec /opt/insightlog/venv/bin/insightlog-gui "$@" 2>/dev/null || \
+exec python3 -m insightlog.gui "$@"
+EOF
+chmod +x /usr/local/bin/insightlog-gui
+
+# ── Desktop launcher ──────────────────────────────────────────
+cat > /usr/share/applications/insightlog.desktop << 'EOF'
+[Desktop Entry]
+Name=InsightLog
+Comment=Linux Security Monitoring Dashboard
+Exec=insightlog-gui
+Icon=security-high
+Terminal=false
+Type=Application
+Categories=System;Security;
+EOF
+
+# ── Systemd service (Type=simple, no double-fork) ─────────────
+echo "[+] Writing systemd service..."
+
+PYTHON_BIN=$(which python3)
+INSIGHTLOG_DIR=$(pwd)
+
+# Detect the logged-in user's display environment
+# SUDO_USER is the user who ran sudo — their session has the display
+REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo '')}"
+REAL_UID=$(id -u "$REAL_USER" 2>/dev/null || echo "1000")
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+
+# Find DISPLAY — check who output for active X session
+DETECTED_DISPLAY=$(who | grep -oP '\(:\d+\)' | head -1 | tr -d '()' || echo ":0")
+XAUTHORITY_PATH="${REAL_HOME}/.Xauthority"
+DBUS_PATH="unix:path=/run/user/${REAL_UID}/bus"
+
+echo "    User       : $REAL_USER (UID $REAL_UID)"
+echo "    Display    : $DETECTED_DISPLAY"
+echo "    Xauthority : $XAUTHORITY_PATH"
+echo "    DBus       : $DBUS_PATH"
+
 cat > /etc/systemd/system/insightlog.service << EOF
 [Unit]
 Description=InsightLog Security Monitor
 After=network.target syslog.target
+Wants=network.target
 
 [Service]
-Type=forking
-ExecStart=$VENV_DIR/bin/insightlog start
-ExecStop=$VENV_DIR/bin/insightlog stop
-PIDFile=/var/run/insightlog.pid
-Restart=on-failure
+Type=simple
+ExecStart=${PYTHON_BIN} -m insightlog.daemon_simple
+WorkingDirectory=${INSIGHTLOG_DIR}
+Restart=always
 RestartSec=5
+StandardOutput=append:/var/log/insightlog_daemon.log
+StandardError=append:/var/log/insightlog_daemon.log
+Environment=PYTHONPATH=${INSIGHTLOG_DIR}
+Environment=PYTHONUNBUFFERED=1
+Environment=DISPLAY=${DETECTED_DISPLAY}
+Environment=XAUTHORITY=${XAUTHORITY_PATH}
+Environment=DBUS_SESSION_BUS_ADDRESS=${DBUS_PATH}
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-echo "[7/7] Creating global commands..."
-
-# CLI command
-cat > /usr/local/bin/insightlog << EOF
-#!/usr/bin/env bash
-exec $VENV_DIR/bin/insightlog "\$@"
-EOF
-chmod +x /usr/local/bin/insightlog
-
-# GUI command
-cat > /usr/local/bin/insightlog-gui << EOF
-#!/usr/bin/env bash
-exec $VENV_DIR/bin/insightlog-gui "\$@"
-EOF
-chmod +x /usr/local/bin/insightlog-gui
-
-# Desktop launcher
-cat > /usr/share/applications/insightlog.desktop << EOF
-[Desktop Entry]
-Name=InsightLog
-Comment=Linux Security Monitoring Dashboard
-Exec=/usr/local/bin/insightlog-gui
-Icon=security-high
-Terminal=false
-Type=Application
-Categories=System;Security;Monitor;
-StartupNotify=true
-EOF
-
-# Enable and start daemon
+# ── Enable and start ──────────────────────────────────────────
+echo "[+] Enabling and starting service..."
 systemctl daemon-reload
 systemctl enable insightlog
-systemctl start insightlog
+systemctl restart insightlog
+
+sleep 2
+systemctl status insightlog --no-pager
 
 echo ""
-echo "✓ InsightLog installed successfully!"
+echo "✓ InsightLog installed and running!"
 echo ""
-echo "  Daemon  : $(systemctl is-active insightlog)"
-echo "  Venv    : $VENV_DIR"
-echo "  DBs     : /var/lib/insightlog/"
-echo ""
-echo "  CLI : insightlog <command>"
-echo "  GUI : insightlog-gui"
+echo "Commands:"
+echo "  sudo systemctl status insightlog              — service status"
+echo "  sudo tail -f /var/log/insightlog_daemon.log   — live daemon log"
+echo "  insightlog incidents                          — view incidents"
+echo "  insightlog-gui                                — open dashboard"
 echo ""

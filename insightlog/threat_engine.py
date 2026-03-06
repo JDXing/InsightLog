@@ -99,26 +99,40 @@ _windows: Dict[Tuple, list] = defaultdict(list)
 _lock = threading.Lock()
 
 
-def _window_key(log: dict) -> str:
-    try:
-        pd = json.loads(log.get("parsed_data") or "{}")
-    except Exception:
-        pd = {}
+def _parse_pd(raw) -> dict:
+    """
+    Safely extract parsed_data regardless of whether it is
+    already a dict (fresh from log_ingestor) or a JSON string
+    (read back from the database).
+    """
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+    return {}
+
+
+def _window_key(log: dict, pd: dict) -> str:
+    """Group events by source IP or user for window counting."""
     return pd.get("ip") or pd.get("user") or log.get("host") or "global"
 
 
 def evaluate(log: dict, log_id: int, on_threat=None):
-    try:
-        pd = json.loads(log.get("parsed_data") or "{}")
-    except Exception:
-        pd = {}
+    """
+    Check a parsed log against all rules using sliding time windows.
+    Calls on_threat(incident_dict) if a rule fires.
+    """
+    pd = _parse_pd(log.get("parsed_data"))
 
     event_type = pd.get("event_type")
     if not event_type or event_type not in RULE_MAP:
         return
 
     rule   = RULE_MAP[event_type]
-    key    = (event_type, _window_key(log))
+    key    = (event_type, _window_key(log, pd))
     now    = time.time()
     cutoff = now - rule["window_sec"]
 
@@ -126,6 +140,8 @@ def evaluate(log: dict, log_id: int, on_threat=None):
         _windows[key].append(now)
         _windows[key] = [t for t in _windows[key] if t >= cutoff]
         count = len(_windows[key])
+
+    print(f"[ThreatEngine] {event_type} count={count}/{rule['threshold']} key={key[1]}", flush=True)
 
     if count >= rule["threshold"]:
         with _lock:
@@ -143,8 +159,7 @@ def evaluate(log: dict, log_id: int, on_threat=None):
         }
         inc_id = db.insert_incident(incident)
         incident["id"] = inc_id
-        print(f"\n[THREAT] {rule['severity'].upper()} — "
-              f"{rule['name']} (incident #{inc_id})")
+        print(f"\n[THREAT] {rule['severity'].upper()} — {rule['name']} (incident #{inc_id})", flush=True)
         if on_threat:
             on_threat(incident)
 
@@ -156,15 +171,13 @@ def suggest_actions(incident: dict) -> list:
 
     suggestions = {
         "SSH Brute Force": [
-            f"Block IP: iptables -A INPUT -s {ip} -j DROP"
-                if ip else "Block attacking IP with iptables",
+            f"Block IP: iptables -A INPUT -s {ip} -j DROP" if ip else "Block attacking IP with iptables",
             f"Lock user: passwd -l {user}" if user else "Audit SSH accounts",
             "Disable password auth in /etc/ssh/sshd_config",
             "Enable fail2ban: systemctl enable --now fail2ban",
         ],
         "SSH Invalid User Scan": [
-            f"Block IP: iptables -A INPUT -s {ip} -j DROP"
-                if ip else "Block scanning IP",
+            f"Block IP: iptables -A INPUT -s {ip} -j DROP" if ip else "Block scanning IP",
             "Restrict SSH with AllowUsers in sshd_config",
         ],
         "Root Login": [
@@ -181,13 +194,11 @@ def suggest_actions(incident: dict) -> list:
             "Check /etc/passwd for unauthorized accounts",
         ],
         "Password Change": [
-            f"Verify {user} authorized this change"
-                if user else "Audit recent password changes",
+            f"Verify {user} authorized this change" if user else "Audit recent password changes",
             "Check for unauthorized access before change",
         ],
         "Port Scan Detected": [
-            f"Block scanner: iptables -A INPUT -s {ip} -j DROP"
-                if ip else "Identify scan source",
+            f"Block scanner: iptables -A INPUT -s {ip} -j DROP" if ip else "Identify scan source",
             "Review open ports: ss -tlnp",
             "Harden firewall rules with ufw",
         ],
