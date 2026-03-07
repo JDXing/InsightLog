@@ -100,11 +100,6 @@ _lock = threading.Lock()
 
 
 def _parse_pd(raw) -> dict:
-    """
-    Safely extract parsed_data regardless of whether it is
-    already a dict (fresh from log_ingestor) or a JSON string
-    (read back from the database).
-    """
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str):
@@ -116,17 +111,11 @@ def _parse_pd(raw) -> dict:
 
 
 def _window_key(log: dict, pd: dict) -> str:
-    """Group events by source IP or user for window counting."""
     return pd.get("ip") or pd.get("user") or log.get("host") or "global"
 
 
 def evaluate(log: dict, log_id: int, on_threat=None):
-    """
-    Check a parsed log against all rules using sliding time windows.
-    Calls on_threat(incident_dict) if a rule fires.
-    """
     pd = _parse_pd(log.get("parsed_data"))
-
     event_type = pd.get("event_type")
     if not event_type or event_type not in RULE_MAP:
         return
@@ -165,55 +154,65 @@ def evaluate(log: dict, log_id: int, on_threat=None):
 
 
 def suggest_actions(incident: dict) -> list:
+    """
+    Return suggested actions for an incident.
+    Lines starting with '#' are manual/informational — shown greyed out in GUI.
+    All other lines are real shell commands that can be executed directly.
+    """
     t    = incident.get("threat_type", "")
     ip   = incident.get("source_ip", "")
     user = incident.get("affected_user", "")
 
     suggestions = {
         "SSH Brute Force": [
-            f"Block IP: iptables -A INPUT -s {ip} -j DROP" if ip else "Block attacking IP with iptables",
-            f"Lock user: passwd -l {user}" if user else "Audit SSH accounts",
-            "Disable password auth in /etc/ssh/sshd_config",
-            "Enable fail2ban: systemctl enable --now fail2ban",
+            f"iptables -A INPUT -s {ip} -j DROP"                                         if ip   else "# No source IP — identify attacker manually",
+            f"passwd -l {user}"                                                           if user else "# No user identified — audit SSH accounts",
+            "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && systemctl restart ssh",
+            "systemctl enable --now fail2ban",
         ],
         "SSH Invalid User Scan": [
-            f"Block IP: iptables -A INPUT -s {ip} -j DROP" if ip else "Block scanning IP",
-            "Restrict SSH with AllowUsers in sshd_config",
+            f"iptables -A INPUT -s {ip} -j DROP"                                         if ip   else "# No source IP — identify scanner manually",
+            "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && systemctl restart ssh",
+            "# Manual: add AllowUsers directive to /etc/ssh/sshd_config",
         ],
         "Root Login": [
-            "Disable root SSH: set PermitRootLogin no in sshd_config",
-            "Enforce sudo usage instead of direct root login",
-            "Review root login source immediately",
+            "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config && systemctl restart ssh",
+            "last | head -20",
+            "# Manual: enforce sudo usage — ensure wheel/sudo group is configured",
         ],
         "Privilege Escalation Failed": [
-            f"Investigate user {user}" if user else "Audit sudoers",
-            "Review /etc/sudoers for unnecessary permissions",
+            f"passwd -l {user}"                                                           if user else "# No user identified — audit sudoers manually",
+            "cat /etc/sudoers",
+            "last | head -20",
         ],
         "Unexpected New User Created": [
-            f"Remove user: userdel -r {user}" if user else "Audit new accounts",
-            "Check /etc/passwd for unauthorized accounts",
+            f"userdel -r {user}"                                                          if user else "# No user identified — check /etc/passwd manually",
+            "cat /etc/passwd | tail -10",
+            "last | head -10",
         ],
         "Password Change": [
-            f"Verify {user} authorized this change" if user else "Audit recent password changes",
-            "Check for unauthorized access before change",
+            f"passwd -l {user}"                                                           if user else "# No user identified — review recent password changes",
+            "last | head -10",
+            "# Manual: verify the password change was authorized",
         ],
         "Port Scan Detected": [
-            f"Block scanner: iptables -A INPUT -s {ip} -j DROP" if ip else "Identify scan source",
-            "Review open ports: ss -tlnp",
-            "Harden firewall rules with ufw",
+            f"iptables -A INPUT -s {ip} -j DROP"                                         if ip   else "# No source IP — identify scanner manually",
+            "ss -tlnp",
+            "ufw enable",
         ],
         "Kernel Panic / OOM": [
-            "Check memory usage: free -h",
-            "Review kernel log: journalctl -k --since today",
-            "Consider system reboot if unstable",
+            "free -h",
+            "journalctl -k --since today --no-pager | tail -50",
+            "# Manual: consider rescheduling services or adding swap if OOM",
         ],
         "Disk / IO Error": [
-            "Check disk health: smartctl -a /dev/sda",
-            "Run filesystem check: fsck /dev/sda1",
-            "Review kernel log for disk errors",
+            "smartctl -a /dev/sda",
+            "journalctl -k --since today --no-pager | tail -30",
+            "# Manual: back up data immediately if smartctl shows failures",
         ],
     }
+
     return suggestions.get(t, [
-        "Investigate logs manually",
-        "Escalate to senior administrator",
+        "# Unknown threat — investigate logs manually",
+        "journalctl --since today --no-pager | tail -50",
     ])

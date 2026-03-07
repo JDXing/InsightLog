@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-InsightLog - CLI Entry Point
+InsightLog — CLI Entry Point
 """
 import sys
 import os
@@ -15,24 +15,24 @@ def require_root():
 
 def cmd_start(args):
     require_root()
-    from insightlog.daemon import start_daemon
+    from insightlog.daemon_simple import start_daemon
     start_daemon()
 
 
 def cmd_stop(args):
     require_root()
-    from insightlog.daemon import stop_daemon
+    from insightlog.daemon_simple import stop_daemon
     stop_daemon()
 
 
 def cmd_status(args):
-    from insightlog.daemon import status_daemon
+    from insightlog.daemon_simple import status_daemon
     status_daemon()
 
 
 def cmd_foreground(args):
     require_root()
-    from insightlog.daemon import run_foreground
+    from insightlog.daemon_simple import run_foreground
     run_foreground()
 
 
@@ -75,13 +75,11 @@ def cmd_respond(args):
     if not inc:
         print(f"[ERROR] Incident #{args.incident} not found.")
         sys.exit(1)
-    print(f"\nIncident #{args.incident}: "
-          f"{inc['threat_type']} [{inc['severity']}]")
+    print(f"\nIncident #{args.incident}: {inc['threat_type']} [{inc['severity']}]")
     print(f"  {inc['description']}\n")
     actions = suggest_actions(inc)
     interactive_execute(args.incident, actions)
-    db.update_incident(args.incident, "mitigated",
-                       "Executed via respond command.")
+    db.update_incident(args.incident, "mitigated", "Executed via respond command.")
 
 
 def cmd_postmortem(args):
@@ -115,7 +113,11 @@ def cmd_audit(args):
     from insightlog import db_manager as db
     from insightlog.decision_support import fmt_time
     db.init_all()
-    rows = db.query_audit(args.incident, limit=args.limit)
+    # FIX: use keyword argument so query_audit filters by incident_id correctly
+    rows = db.query_audit(incident_id=args.incident, limit=args.limit)
+    if not rows:
+        print("  No audit records found.")
+        return
     print(f"\n  {'Time':<18} {'Inc':<5} {'Type':<20} OK  Command")
     print("  " + "─" * 70)
     for r in rows:
@@ -140,8 +142,7 @@ def main():
     sub.add_parser("foreground", help="Run in foreground (debug)")
 
     p_ing = sub.add_parser("ingest", help="Manually ingest logs into D1")
-    p_ing.add_argument("--type",
-                       choices=["syslog", "auth", "all"], default="all")
+    p_ing.add_argument("--type", choices=["syslog", "auth", "all"], default="all")
 
     p_inc = sub.add_parser("incidents", help="List incidents from D2")
     p_inc.add_argument("--status", default="open",

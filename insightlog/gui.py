@@ -181,18 +181,58 @@ SAFE_COMMANDS = [
     "iptables", "ufw", "passwd", "userdel", "usermod",
     "systemctl", "pkill", "kill", "ss", "netstat",
     "who", "last", "journalctl", "smartctl", "fsck",
-    "free", "vmstat", "fail2ban-client",
+    "free", "vmstat", "fail2ban-client", "sed", "cat",
 ]
 
 
+
+INSTALL_HINTS = {
+    "fail2ban":        "sudo apt install fail2ban -y",
+    "ufw":             "sudo apt install ufw -y",
+    "smartctl":        "sudo apt install smartmontools -y",
+    "iptables":        "sudo apt install iptables -y",
+    "ss":              "sudo apt install iproute2 -y",
+    "journalctl":      "sudo apt install systemd -y",
+}
+
+def _install_hint(cmd: str) -> str:
+    """Return install hint if the first command word has a known package."""
+    first = os.path.basename(cmd.strip().split()[0])
+    return INSTALL_HINTS.get(first, "")
+
 def is_safe_cmd(cmd):
+    """Check the first real command in a potentially compound shell command."""
     try:
-        parts = shlex.split(cmd)
+        # Strip leading bash built-ins / env vars to get the actual executable
+        first = cmd.strip().split()[0]
+        # Handle var=val prefix (e.g. "FOO=bar cmd ...")
+        while "=" in first and not first.startswith("/"):
+            parts = cmd.strip().split(None, 1)
+            if len(parts) < 2:
+                return False
+            cmd   = parts[1]
+            first = cmd.strip().split()[0]
+        return os.path.basename(first) in SAFE_COMMANDS
     except Exception:
         return False
-    if not parts:
-        return False
-    return os.path.basename(parts[0]) in SAFE_COMMANDS
+
+
+
+
+
+def make_readonly(widget):
+    """Allow select/copy but block typing, paste, delete."""
+    def _guard(e):
+        # Allow Ctrl+C (copy), Ctrl+A (select all), Ctrl+X (cut=copy here)
+        if e.state & 0x4 and e.keysym.lower() in ('c', 'a', 'x'):
+            return
+        # Allow navigation and selection keys
+        if e.keysym in ('Left', 'Right', 'Up', 'Down', 'Home', 'End',
+                        'Prior', 'Next', 'shift_L', 'shift_R',
+                        'Control_L', 'Control_R', 'Alt_L', 'Alt_R'):
+            return
+        return "break"
+    widget.bind("<Key>", _guard)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -293,18 +333,25 @@ class RespondDialog(tk.Toplevel):
                  font=("Courier New", 9, "bold")).pack(anchor="w", pady=(0, 6))
 
         for i, action in enumerate(self.actions):
-            cmd_text = action.split(":", 1)[1].strip() if ":" in action else action
+            is_manual = action.startswith("#")
+            cmd_text  = action.lstrip("# ") if is_manual else action
             f = tk.Frame(body, bg=C["bg3"],
                          highlightbackground=C["border"], highlightthickness=1)
             f.pack(fill="x", pady=3)
+            # Pack button/label on right FIRST so it gets priority in layout
+            if not is_manual:
+                StyledButton(f, "Execute",
+                    command=lambda c=cmd_text: self._confirm_execute(c),
+                    style="danger", width=9).pack(side="right", padx=6, pady=4)
+            else:
+                tk.Label(f, text="Manual", bg=C["bg3"], fg=C["subtext"],
+                         font=("Courier New", 8), width=9, anchor="center").pack(side="right", padx=6, pady=4)
             tk.Label(f, text=f"  {i+1}.", bg=C["bg3"], fg=C["subtext"],
                      font=("Courier New", 9), width=4).pack(side="left")
-            tk.Label(f, text=action[:65], bg=C["bg3"], fg=C["text"],
-                     font=("Courier New", 9), anchor="w").pack(
-                         side="left", fill="x", expand=True, padx=4)
-            StyledButton(f, "Execute",
-                command=lambda c=cmd_text: self._confirm_execute(c),
-                style="danger").pack(side="right", padx=6, pady=4)
+            tk.Label(f, text=action[:55],
+                     bg=C["bg3"], fg=C["subtext"] if is_manual else C["text"],
+                     font=("Courier New", 9, "italic" if is_manual else "normal"),
+                     anchor="w").pack(side="left", fill="x", expand=True, padx=4)
 
         tk.Label(body, text="CUSTOM COMMAND", bg=C["bg"], fg=C["accent"],
                  font=("Courier New", 9, "bold")).pack(anchor="w", pady=(14, 6))
@@ -323,9 +370,10 @@ class RespondDialog(tk.Toplevel):
         self.output = scrolledtext.ScrolledText(
             body, height=6, bg=C["bg2"], fg=C["green"],
             font=("Courier New", 9), relief="flat",
-            insertbackground=C["green"], state="disabled"
+            insertbackground=C["green"]
         )
         self.output.pack(fill="x")
+        make_readonly(self.output)
 
         btn_row = tk.Frame(self, bg=C["bg"], padx=20, pady=12)
         btn_row.pack(fill="x")
@@ -335,10 +383,8 @@ class RespondDialog(tk.Toplevel):
             command=self.destroy, style="ghost").pack(side="right")
 
     def _log_output(self, text):
-        self.output.config(state="normal")
         self.output.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {text}\n")
         self.output.see("end")
-        self.output.config(state="disabled")
 
     def _confirm_execute(self, cmd):
         if not messagebox.askyesno("Confirm", f"Execute?\n\n{cmd}\n\nThis will be logged to D3.", parent=self):
@@ -356,9 +402,25 @@ class RespondDialog(tk.Toplevel):
 
     def _execute(self, cmd):
         self._log_output(f"$ {cmd}")
+        # Check if the primary executable exists before running
         try:
+            primary = cmd.strip().split()[0].split("&&")[0].strip()
+            # For compound commands, get first actual binary
+            for token in cmd.replace("&&", " ").replace("|", " ").split():
+                if not token.startswith("-") and "=" not in token:
+                    primary = token
+                    break
+            result = subprocess.run(["which", primary], capture_output=True, text=True)
+            if result.returncode != 0:
+                self._log_output(f"Error: '{primary}' is not installed.")
+                self._log_output(f"Hint:  sudo apt install {primary}")
+                return
+        except Exception:
+            pass
+        try:
+            # Use bash -c so &&, pipes, and compound commands work correctly
             proc = subprocess.run(
-                shlex.split(cmd), capture_output=True, text=True, timeout=30)
+                ["bash", "-c", cmd], capture_output=True, text=True, timeout=30)
             out     = (proc.stdout + proc.stderr).strip()
             success = proc.returncode == 0
             self._log_output(out or "(no output)")
@@ -707,8 +769,9 @@ class InsightLogApp(tk.Tk):
         self._respond_output = scrolledtext.ScrolledText(
             page, height=8, bg=C["bg2"], fg=C["green"],
             font=("Courier New", 9), relief="flat",
-            insertbackground=C["green"], state="disabled")
+            insertbackground=C["green"])
         self._respond_output.pack(fill="x", padx=16, pady=(0, 12))
+        make_readonly(self._respond_output)
         self._current_respond_inc = None
 
     # ── Postmortem Page ───────────────────────────────────────────────────────
@@ -1146,18 +1209,25 @@ class InsightLogApp(tk.Tk):
             w.destroy()
 
         for i, action in enumerate(suggest_actions(inc)):
-            cmd = action.split(":", 1)[1].strip() if ":" in action else action
+            is_manual = action.startswith("#")
+            cmd       = action.lstrip("# ") if is_manual else action
             f   = tk.Frame(self._suggest_frame, bg=C["bg3"],
                            highlightbackground=C["border"], highlightthickness=1)
             f.pack(fill="x", pady=2)
+            # Pack button/label on right FIRST so it gets priority in layout
+            if not is_manual:
+                StyledButton(f, "Execute",
+                    command=lambda c=cmd: self._respond_page_execute(c),
+                    style="danger", width=9).pack(side="right", padx=6, pady=3)
+            else:
+                tk.Label(f, text="Manual", bg=C["bg3"], fg=C["subtext"],
+                         font=("Courier New", 8), width=9, anchor="center").pack(side="right", padx=6, pady=3)
             tk.Label(f, text=f" {i+1}.", bg=C["bg3"], fg=C["subtext"],
                      font=("Courier New", 9), width=3).pack(side="left")
-            tk.Label(f, text=action[:70], bg=C["bg3"], fg=C["text"],
-                     font=("Courier New", 9), anchor="w").pack(
-                         side="left", fill="x", expand=True, padx=4)
-            StyledButton(f, "Execute",
-                command=lambda c=cmd: self._respond_page_execute(c),
-                style="danger").pack(side="right", padx=6, pady=3)
+            tk.Label(f, text=action[:60],
+                     bg=C["bg3"], fg=C["subtext"] if is_manual else C["text"],
+                     font=("Courier New", 9, "italic" if is_manual else "normal"),
+                     anchor="w").pack(side="left", fill="x", expand=True, padx=4)
 
     def _respond_page_execute(self, cmd):
         if not self._current_respond_inc:
@@ -1167,7 +1237,7 @@ class InsightLogApp(tk.Tk):
             return
         self._respond_log(f"$ {cmd}")
         try:
-            proc = subprocess.run(shlex.split(cmd), capture_output=True, text=True, timeout=30)
+            proc = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=30)
             out  = (proc.stdout + proc.stderr).strip()
             self._respond_log(out or "(no output)")
             db.insert_audit({
@@ -1192,10 +1262,8 @@ class InsightLogApp(tk.Tk):
         self._respond_page_execute(cmd)
 
     def _respond_log(self, text):
-        self._respond_output.config(state="normal")
         self._respond_output.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {text}\n")
         self._respond_output.see("end")
-        self._respond_output.config(state="disabled")
 
     # ── Live Feed ─────────────────────────────────────────────────────────────
 
