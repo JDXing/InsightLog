@@ -7,8 +7,9 @@ import re
 import os
 import time
 import threading
+import subprocess
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, Dict
 
 from insightlog import db_manager as db
 
@@ -46,15 +47,84 @@ EVENT_PATTERNS = {
 }
 
 LOG_FILES = {
-    "syslog": ["/var/log/syslog", "/var/log/messages"],
-    "auth":   ["/var/log/auth.log", "/var/log/secure"],
+    "syslog": [
+        "/var/log/syslog",       # Debian/Ubuntu/Kali
+        "/var/log/messages",     # RHEL/CentOS/Fedora
+        "/var/log/kern.log",     # Kali fallback
+        "/var/log/daemon.log",   # Another Kali fallback
+    ],
+    "auth": [
+        "/var/log/auth.log",     # Debian/Ubuntu/Kali
+        "/var/log/secure",       # RHEL/CentOS/Fedora
+    ],
 }
+
+# Cache so we don't re-check every call
+_log_path_cache: Dict[str, Optional[str]] = {}
+
+
+def _ensure_syslog() -> bool:
+    """Auto-installs rsyslog on Kali/journald systems where syslog is missing."""
+    for p in LOG_FILES["syslog"]:
+        if os.path.exists(p):
+            return True
+    try:
+        print("[Ingestor] syslog not found — installing rsyslog automatically...", flush=True)
+        result = subprocess.run(
+            ["apt-get", "install", "-y", "-q", "rsyslog"],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0:
+            subprocess.run(["systemctl", "enable", "--now", "rsyslog"],
+                           capture_output=True, timeout=10)
+            time.sleep(2)
+            for p in LOG_FILES["syslog"]:
+                if os.path.exists(p):
+                    print(f"[Ingestor] rsyslog installed — now watching {p}", flush=True)
+                    return True
+    except Exception as e:
+        print(f"[Ingestor] Could not auto-install rsyslog: {e}", flush=True)
+    try:
+        syslog_path = "/var/log/syslog"
+        print("[Ingestor] Falling back to journald export...", flush=True)
+        subprocess.run(
+            f"journalctl -o short-traditional --no-pager -n 10000 > {syslog_path}",
+            shell=True, capture_output=True, timeout=15
+        )
+        if os.path.exists(syslog_path) and os.path.getsize(syslog_path) > 0:
+            os.chmod(syslog_path, 0o644)
+            print(f"[Ingestor] Journald exported to {syslog_path}", flush=True)
+            return True
+    except Exception as e:
+        print(f"[Ingestor] Journald export failed: {e}", flush=True)
+    return False
+
+
+def _ensure_log_readable(path: str) -> bool:
+    """Makes a log file readable without requiring manual chmod."""
+    if not os.path.exists(path):
+        return False
+    if os.access(path, os.R_OK):
+        return True
+    try:
+        subprocess.run(["sudo", "chmod", "a+r", path],
+                       capture_output=True, timeout=5)
+        return os.access(path, os.R_OK)
+    except Exception:
+        return False
 
 
 def find_log(log_type: str) -> Optional[str]:
+    """Find the best available log file, auto-handling missing syslog."""
+    if log_type in _log_path_cache:
+        return _log_path_cache[log_type]
+    if log_type == "syslog":
+        _ensure_syslog()
     for p in LOG_FILES.get(log_type, []):
-        if os.path.exists(p):
+        if _ensure_log_readable(p):
+            _log_path_cache[log_type] = p
             return p
+    _log_path_cache[log_type] = None
     return None
 
 
@@ -127,23 +197,36 @@ class LogTailer(threading.Thread):
         self._stop      = threading.Event()
 
     def run(self):
-        path = find_log(self.log_type)
+        # Retry up to 10 times — handles rsyslog startup delay
+        path = None
+        for attempt in range(10):
+            _log_path_cache.pop(self.log_type, None)
+            path = find_log(self.log_type)
+            if path:
+                break
+            if attempt < 9:
+                print(f"[Tailer] {self.log_type}: not available yet, "
+                      f"retrying in 3s... ({attempt+1}/10)", flush=True)
+                time.sleep(3)
         if not path:
-            print(f"[Tailer] {self.log_type}: file not found.")
+            print(f"[Tailer] {self.log_type}: log file not found after retries. Skipping.", flush=True)
             return
-        print(f"[Tailer] Watching {path}")
-        with open(path, "r", errors="replace") as f:
-            f.seek(0, 2)
-            while not self._stop.is_set():
-                line = f.readline()
-                if not line:
-                    time.sleep(0.2)
-                    continue
-                parsed = parse_line(line, path)
-                if parsed:
-                    log_id = db.insert_log(parsed)
-                    if self.on_new_log:
-                        self.on_new_log(parsed, log_id)
+        print(f"[Tailer] Watching {path}", flush=True)
+        try:
+            with open(path, "r", errors="replace") as f:
+                f.seek(0, 2)
+                while not self._stop.is_set():
+                    line = f.readline()
+                    if not line:
+                        time.sleep(0.2)
+                        continue
+                    parsed = parse_line(line, path)
+                    if parsed:
+                        log_id = db.insert_log(parsed)
+                        if self.on_new_log:
+                            self.on_new_log(parsed, log_id)
+        except Exception as e:
+            print(f"[Tailer] {self.log_type}: error reading {path}: {e}", flush=True)
 
     def stop(self):
         self._stop.set()

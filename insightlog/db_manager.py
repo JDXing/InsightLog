@@ -10,12 +10,36 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-DB_DIR = Path("/var/lib/insightlog")
+def _get_db_dir() -> Path:
+    """
+    Returns a writable database directory.
+    Priority:
+      1. /var/lib/insightlog  (writable — set up by installer)
+      2. ~/.local/share/insightlog  (fallback for normal users)
+    This means the tool works for any user without needing sudo.
+    """
+    system_dir = Path("/var/lib/insightlog")
+    try:
+        system_dir.mkdir(parents=True, exist_ok=True)
+        test = system_dir / ".write_test"
+        test.touch()
+        test.unlink()
+        return system_dir
+    except (PermissionError, OSError):
+        user_dir = Path.home() / ".local" / "share" / "insightlog"
+        user_dir.mkdir(parents=True, exist_ok=True)
+        import warnings
+        warnings.warn(
+            f"[InsightLog] /var/lib/insightlog not writable — using {user_dir}. "
+            "Run 'sudo ./install.sh' for full functionality.",
+            RuntimeWarning, stacklevel=2
+        )
+        return user_dir
 
 
 def _conn(db_name: str) -> sqlite3.Connection:
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(str(DB_DIR / f"{db_name}.db"), check_same_thread=False)
+    db_dir = _get_db_dir()
+    c = sqlite3.connect(str(db_dir / f"{db_name}.db"), check_same_thread=False)
     c.row_factory = sqlite3.Row
     return c
 
@@ -230,4 +254,5 @@ def init_all():
     init_d1()
     init_d2()
     init_d3()
-    print("[DB] All databases initialized.")
+    db_dir = _get_db_dir()
+    print(f"[DB] All databases initialized at {db_dir}")

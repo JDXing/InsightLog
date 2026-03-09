@@ -44,3 +44,36 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ── CLI-callable helpers (imported by cli.py) ─────────────────────────────────
+
+PID_FILE = "/var/run/insightlog.pid"
+
+def start_daemon():
+    """Start via systemd — just show guidance."""
+    import os
+    print("[Daemon] Use: sudo systemctl start insightlog")
+
+def stop_daemon():
+    """Stop via systemd — just show guidance."""
+    print("[Daemon] Use: sudo systemctl stop insightlog")
+
+def status_daemon():
+    """Show systemd service status."""
+    import subprocess
+    result = subprocess.run(
+        ["systemctl", "is-active", "insightlog"],
+        capture_output=True, text=True
+    )
+    state = result.stdout.strip()
+    if state == "active":
+        print("[Daemon] Status: RUNNING (managed by systemd)")
+    else:
+        print(f"[Daemon] Status: {state.upper()}")
+    subprocess.run(["systemctl", "status", "insightlog", "--no-pager"],
+                   capture_output=False)
+
+def run_foreground():
+    """Run daemon in foreground for debugging."""
+    print("[Daemon] Running in foreground (Ctrl+C to stop)")
+    main()
