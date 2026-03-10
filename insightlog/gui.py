@@ -779,6 +779,7 @@ class InsightLogApp(tk.Tk):
     def _build_postmortem_page(self):
         page = self._pages["postmortem"]
 
+        # ── Header ────────────────────────────────────────────────────────────
         hdr = tk.Frame(page, bg=C["bg"])
         hdr.pack(fill="x", padx=16, pady=12)
         tk.Label(hdr, text="POSTMORTEM ANALYSIS", bg=C["bg"], fg=C["accent"],
@@ -794,10 +795,15 @@ class InsightLogApp(tk.Tk):
         StyledButton(ctrl, "Analyze",
                      command=self._run_postmortem, style="primary").pack(side="left")
 
-        card = Card(page, title="▸ ANALYSIS REPORT")
-        card.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        # ── Split pane: top=report, bottom=chatbot ────────────────────────────
+        pane = tk.PanedWindow(page, orient="vertical",
+                              bg=C["border"], sashwidth=5, sashrelief="flat")
+        pane.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+
+        # ── Top: analysis report ──────────────────────────────────────────────
+        top_card = Card(page, title="▸ ANALYSIS REPORT")
         self._pm_output = scrolledtext.ScrolledText(
-            card, bg=C["bg2"], fg=C["text"],
+            top_card, bg=C["bg2"], fg=C["text"],
             font=("Courier New", 9), relief="flat", state="disabled")
         self._pm_output.pack(fill="both", expand=True, padx=8, pady=8)
         for tag, fg, bold in [
@@ -811,6 +817,540 @@ class InsightLogApp(tk.Tk):
         ]:
             font = ("Courier New", 10, "bold") if bold else ("Courier New", 9)
             self._pm_output.tag_config(tag, foreground=fg, font=font)
+        pane.add(top_card, minsize=100)
+
+        # ── Bottom: chatbot panel ─────────────────────────────────────────────
+        bot_frame = tk.Frame(page, bg=C["panel"],
+                             highlightbackground=C["border"], highlightthickness=1)
+
+        # Chat header with "?" help button
+        chat_hdr = tk.Frame(bot_frame, bg=C["bg3"], pady=5)
+        chat_hdr.pack(fill="x")
+        tk.Label(chat_hdr, text="▸ SECURITY ASSISTANT",
+                 bg=C["bg3"], fg=C["accent"],
+                 font=("Courier New", 9, "bold"), padx=12).pack(side="left")
+        StyledButton(chat_hdr, "?  Commands",
+                     command=self._chat_show_help,
+                     style="ghost").pack(side="right", padx=8, pady=2)
+
+        # Chat log
+        self._chat_log = scrolledtext.ScrolledText(
+            bot_frame, bg=C["bg2"], fg=C["text"],
+            font=("Courier New", 9), relief="flat",
+            state="disabled", height=8)
+        self._chat_log.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        for tag, clr, bold in [
+            ("user",      C["accent"],  True),
+            ("bot",       C["green"],   False),
+            ("bot_label", C["green"],   True),
+            ("err",       C["red"],     False),
+            ("dim",       C["subtext"], False),
+            ("hi",        C["yellow"],  False),
+        ]:
+            fnt = ("Courier New", 9, "bold") if bold else ("Courier New", 9)
+            self._chat_log.tag_config(tag, foreground=clr, font=fnt)
+
+        # Input row
+        inp_row = tk.Frame(bot_frame, bg=C["panel"], padx=8, pady=6)
+        inp_row.pack(fill="x")
+        tk.Label(inp_row, text="›", bg=C["panel"], fg=C["accent"],
+                 font=("Courier New", 12, "bold")).pack(side="left", padx=(0, 6))
+        self._chat_input = tk.Entry(
+            inp_row, bg=C["bg3"], fg=C["white"],
+            insertbackground=C["accent"],
+            font=("Courier New", 10), relief="flat",
+            highlightbackground=C["border"], highlightthickness=1)
+        self._chat_input.pack(side="left", fill="x", expand=True, ipady=6)
+        self._chat_input.bind("<Return>", lambda e: self._chat_send())
+        StyledButton(inp_row, "Send",
+                     command=self._chat_send, style="primary").pack(side="left", padx=(8, 0))
+        StyledButton(inp_row, "Clear",
+                     command=self._chat_clear, style="ghost").pack(side="left", padx=(4, 0))
+
+        pane.add(bot_frame, minsize=100)
+
+        # Chat state
+        self._chat_history = []
+        self._chat_welcome()
+
+
+    # ── Chatbot ───────────────────────────────────────────────────────────────
+
+    # Full command reference shown when user clicks "? Commands"
+    CHAT_COMMANDS = [
+        ("INCIDENTS",
+         "how many incidents",       "Count all incidents by status"),
+        ("INCIDENTS",
+         "how many open incidents",  "Count only open incidents"),
+        ("INCIDENTS",
+         "how many critical",        "Count critical severity incidents"),
+        ("INCIDENTS",
+         "show open incidents",      "List all unresolved incidents"),
+        ("INCIDENTS",
+         "show critical incidents",  "List critical severity incidents"),
+        ("INCIDENTS",
+         "show high incidents",      "List high severity incidents"),
+        ("INCIDENTS",
+         "recent incidents",         "List the 10 most recent incidents"),
+        ("INCIDENTS",
+         "list all incidents",       "List all incidents regardless of status"),
+        ("INCIDENTS",
+         "incident #<N>",            "Full detail for a specific incident + its audit trail"),
+        ("THREAT TYPES",
+         "any brute force attacks",  "Find SSH Brute Force incidents"),
+        ("THREAT TYPES",
+         "any root login",           "Find Root Login incidents"),
+        ("THREAT TYPES",
+         "any invalid user",         "Find SSH Invalid User Scan incidents"),
+        ("THREAT TYPES",
+         "any new user",             "Find Unexpected New User Created incidents"),
+        ("THREAT TYPES",
+         "any privilege escalation", "Find Privilege Escalation Failed incidents"),
+        ("THREAT TYPES",
+         "any port scan",            "Find Port Scan Detected incidents"),
+        ("THREAT TYPES",
+         "any kernel panic",         "Find Kernel Panic / OOM incidents"),
+        ("THREAT TYPES",
+         "any disk error",           "Find Disk / IO Error incidents"),
+        ("THREAT TYPES",
+         "any password change",      "Find Password Change incidents"),
+        ("ATTACKERS",
+         "which ips attacked most",  "Top attacking source IPs across all incidents"),
+        ("ATTACKERS",
+         "affected users",           "Users most frequently seen in incidents"),
+        ("LOGS  (D1)",
+         "how many logs",            "Total log entry count and breakdown by type"),
+        ("LOGS  (D1)",
+         "show auth logs",           "Last 10 auth log entries"),
+        ("LOGS  (D1)",
+         "show syslog",              "Last 10 syslog entries"),
+        ("LOGS  (D1)",
+         "search for <keyword>",     "Search D1 log messages for a keyword"),
+        ("AUDIT (D3)",
+         "what commands were executed", "Last 10 D3 audit trail entries"),
+        ("AUDIT (D3)",
+         "show audit trail",         "Same as above"),
+        ("OVERVIEW",
+         "security summary",         "Combined overview: logs + incidents + last action"),
+        ("OVERVIEW",
+         "status",                   "Same as security summary"),
+        ("OVERVIEW",
+         "help",                     "Show this command list in the chat"),
+    ]
+
+    def _chat_welcome(self):
+        self._chat_print("bot_label", "SECURITY ASSISTANT")
+        self._chat_print("bot",
+            "Ask me about your incidents, logs, and audit trail.\n"
+            "Click  \"? Commands\"  to see everything I understand, or type  help.")
+
+    def _chat_show_help(self):
+        """Open a scrollable help window listing every supported command."""
+        win = tk.Toplevel(self)
+        win.title("Security Assistant — Command Reference")
+        win.configure(bg=C["bg"])
+        win.geometry("700x540")
+        win.resizable(True, True)
+        win.attributes("-topmost", True)
+
+        # Header
+        hdr = tk.Frame(win, bg=C["accent2"], pady=10)
+        hdr.pack(fill="x")
+        tk.Label(hdr,
+                 text="  Security Assistant — All Supported Commands",
+                 bg=C["accent2"], fg=C["bg"],
+                 font=("Courier New", 11, "bold")).pack(side="left", padx=12)
+
+        intro = tk.Label(win,
+            text=("Commands are matched by keyword — you don't need to type them exactly.\n"
+                  "Example: 'show me critical ones' works the same as 'show critical incidents'."),
+            bg=C["bg"], fg=C["subtext"],
+            font=("Courier New", 8), justify="left", padx=16, pady=8)
+        intro.pack(fill="x")
+
+        # Scrollable table
+        frame = tk.Frame(win, bg=C["bg"])
+        frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        canvas = tk.Canvas(frame, bg=C["bg"], highlightthickness=0)
+        vsb    = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(canvas, bg=C["bg"])
+        canvas_win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_resize(e):
+            canvas.itemconfig(canvas_win, width=e.width)
+        canvas.bind("<Configure>", _on_resize)
+
+        def _on_inner_resize(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        inner.bind("<Configure>", _on_inner_resize)
+
+        # Column headers
+        hdr_row = tk.Frame(inner, bg=C["bg3"])
+        hdr_row.pack(fill="x", pady=(0, 4))
+        for txt, w in [("Category", 16), ("Type this (or similar)", 30), ("What it returns", 36)]:
+            tk.Label(hdr_row, text=txt, bg=C["bg3"], fg=C["accent"],
+                     font=("Courier New", 9, "bold"),
+                     width=w, anchor="w", padx=8, pady=6).pack(side="left")
+
+        # Group commands by category
+        from collections import OrderedDict
+        groups = OrderedDict()
+        for cat, cmd, desc in self.CHAT_COMMANDS:
+            groups.setdefault(cat, []).append((cmd, desc))
+
+        row_bg  = [C["bg2"], C["panel"]]
+        row_idx = 0
+        for cat, cmds in groups.items():
+            # Category divider
+            div = tk.Frame(inner, bg=C["bg3"], pady=3)
+            div.pack(fill="x", pady=(6, 0))
+            tk.Label(div, text=f"  {cat}",
+                     bg=C["bg3"], fg=C["yellow"],
+                     font=("Courier New", 9, "bold"), padx=8).pack(side="left")
+
+            for cmd, desc in cmds:
+                bg = row_bg[row_idx % 2]
+                row = tk.Frame(inner, bg=bg)
+                row.pack(fill="x")
+                # Invisible category cell (spacer)
+                tk.Label(row, text="", bg=bg, width=16).pack(side="left")
+                # Command — clickable, pastes into input
+                cmd_lbl = tk.Label(row,
+                    text=cmd, bg=bg, fg=C["accent"],
+                    font=("Courier New", 9), width=30, anchor="w",
+                    padx=8, pady=4, cursor="hand2")
+                cmd_lbl.pack(side="left")
+                cmd_lbl.bind("<Button-1>",
+                    lambda e, c=cmd: self._chat_paste_command(c))
+                # Description
+                tk.Label(row, text=desc, bg=bg, fg=C["text"],
+                         font=("Courier New", 9), anchor="w",
+                         padx=8, pady=4).pack(side="left", fill="x", expand=True)
+                row_idx += 1
+
+        # Footer hint
+        tk.Label(win,
+                 text="  Click any command to paste it into the chat input.",
+                 bg=C["bg2"], fg=C["subtext"],
+                 font=("Courier New", 8), pady=6).pack(fill="x", side="bottom")
+
+    def _chat_paste_command(self, cmd: str):
+        """Paste a command from the help window into the chat input."""
+        self._chat_input.delete(0, "end")
+        # Replace placeholder like <N> or <keyword> with cursor hint
+        display = cmd.replace("<N>", "").replace("<keyword>", "").rstrip()
+        self._chat_input.insert(0, display)
+        self._chat_input.focus_set()
+
+    def _chat_print(self, tag, text):
+        self._chat_log.config(state="normal")
+        self._chat_log.insert("end", text + "\n", tag)
+        self._chat_log.see("end")
+        self._chat_log.config(state="disabled")
+
+    def _chat_clear(self):
+        self._chat_log.config(state="normal")
+        self._chat_log.delete("1.0", "end")
+        self._chat_log.config(state="disabled")
+        self._chat_history = []
+        self._chat_welcome()
+
+    def _chat_send(self):
+        raw = self._chat_input.get().strip()
+        if not raw:
+            return
+        self._chat_input.delete(0, "end")
+        self._chat_print("user", f"\nYou: {raw}")
+        threading.Thread(target=self._chat_respond, args=(raw,), daemon=True).start()
+
+    def _chat_respond(self, question):
+        try:
+            answer = self._chat_query(question)
+        except Exception as e:
+            answer = f"Error: {e}"
+        self.after(0, lambda: self._chat_print("bot", f"Assistant: {answer}\n"))
+
+    def _chat_query(self, q: str) -> str:
+        ql = q.lower().strip()
+        self._chat_history.append(q)
+        if len(self._chat_history) > 20:
+            self._chat_history = self._chat_history[-20:]
+
+        def inc_line(i):
+            ts  = fmt_time(i.get("detected_at", ""))
+            sev = (i.get("severity") or "").upper()
+            return (f"  #{i.get('id','?')}  [{sev}]  {i.get('threat_type','')}  "
+                    f"IP={i.get('source_ip','—')}  User={i.get('affected_user','—')}  "
+                    f"Status={i.get('status','')}  {ts}")
+
+        import re as _re
+
+        # ── incident #N ───────────────────────────────────────────────────────
+        m = _re.search(r"incident\s*#?(\d+)", ql)
+        if m:
+            inc_id = int(m.group(1))
+            inc = db.get_incident(inc_id)
+            if not inc:
+                return f"Incident #{inc_id} not found."
+            audits = db.query_audit(incident_id=inc_id, limit=10)
+            lines = [
+                f"Incident #{inc_id} Details:",
+                f"  Threat    : {inc.get('threat_type','')}",
+                f"  Severity  : {(inc.get('severity') or '').upper()}",
+                f"  Status    : {inc.get('status','')}",
+                f"  Description: {inc.get('description','')}",
+                f"  Source IP : {inc.get('source_ip','—')}",
+                f"  User      : {inc.get('affected_user','—')}",
+                f"  Detected  : {fmt_time(inc.get('detected_at',''))}",
+            ]
+            if inc.get("notes"):
+                lines.append(f"  Notes     : {inc['notes']}")
+            if audits:
+                lines.append(f"  Audit actions ({len(audits)}):")
+                for a in audits[:5]:
+                    ok = "✓" if a.get("success") else "✗"
+                    lines.append(f"    {ok} {a.get('action_type','')} — "
+                                 f"{(a.get('command','') or '')[:40]}")
+            return "\n".join(lines)
+
+        # ── help ──────────────────────────────────────────────────────────────
+        if any(w in ql for w in ["help", "what can", "commands", "how to"]):
+            lines = ["Supported commands (click '? Commands' for full list):"]
+            seen = set()
+            for cat, cmd, desc in self.CHAT_COMMANDS:
+                if cat not in seen:
+                    lines.append(f"\n  {cat}")
+                    seen.add(cat)
+                lines.append(f"    • {cmd}")
+            return "\n".join(lines)
+
+        # ── count / summary ───────────────────────────────────────────────────
+        if any(w in ql for w in ["how many", "count", "total", "number of"]):
+            incs  = db.query_incidents(limit=2000)
+            stats = db.get_log_stats()
+            open_ = [i for i in incs if i.get("status") == "open"]
+            crit  = [i for i in incs if i.get("severity") == "critical"]
+            high  = [i for i in incs if i.get("severity") == "high"]
+            res   = [i for i in incs if i.get("status") in ("resolved","mitigated")]
+            if "log" in ql:
+                by_type = stats.get("by_type", {})
+                parts = ", ".join(f"{k}: {v}" for k, v in by_type.items())
+                return f"Total log entries: {stats.get('total',0)}\n  By type: {parts or 'none'}"
+            if "open" in ql:
+                return f"Open incidents: {len(open_)}"
+            if "critical" in ql:
+                return (f"Critical incidents: {len(crit)} total "
+                        f"({len([i for i in crit if i.get('status')=='open'])} open)")
+            if "resolv" in ql or "mitigat" in ql:
+                return f"Resolved/mitigated incidents: {len(res)}"
+            return (f"Total incidents: {len(incs)}  |  Open: {len(open_)}  |  "
+                    f"Critical: {len(crit)}  |  High: {len(high)}  |  Resolved: {len(res)}\n"
+                    f"Total log entries: {stats.get('total',0)}")
+
+        # ── threat type matching ───────────────────────────────────────────────
+        threat_map = {
+            "brute":              "SSH Brute Force",
+            "ssh brute":          "SSH Brute Force",
+            "invalid user":       "SSH Invalid User Scan",
+            "root login":         "Root Login",
+            "root":               "Root Login",
+            "new user":           "Unexpected New User Created",
+            "privilege":          "Privilege Escalation Failed",
+            "escalation":         "Privilege Escalation Failed",
+            "port scan":          "Port Scan Detected",
+            "kernel":             "Kernel Panic / OOM",
+            "oom":                "Kernel Panic / OOM",
+            "disk":               "Disk / IO Error",
+            "io error":           "Disk / IO Error",
+            "password change":    "Password Change",
+        }
+        for kw, threat in threat_map.items():
+            if kw in ql:
+                rows = [i for i in db.query_incidents(limit=500)
+                        if threat.lower() in (i.get("threat_type","") or "").lower()]
+                if not rows:
+                    return f"No '{threat}' incidents found."
+                lines = [f"{len(rows)} '{threat}' incident(s):"]
+                for i in rows[:8]:
+                    lines.append(inc_line(i))
+                if len(rows) > 8:
+                    lines.append(f"  ... and {len(rows)-8} more.")
+                return "\n".join(lines)
+
+        # ── severity filters ──────────────────────────────────────────────────
+        if "critical" in ql and any(w in ql for w in ["show","list","get","what","incident"]):
+            rows = db.query_incidents({"severity": "critical"}, limit=20)
+            if not rows: return "No critical incidents found."
+            lines = [f"{len(rows)} critical incident(s):"]
+            for i in rows: lines.append(inc_line(i))
+            return "\n".join(lines)
+
+        if "high" in ql and any(w in ql for w in ["show","list","get","what","incident"]):
+            rows = db.query_incidents({"severity": "high"}, limit=20)
+            if not rows: return "No high severity incidents found."
+            lines = [f"{len(rows)} high severity incident(s):"]
+            for i in rows: lines.append(inc_line(i))
+            return "\n".join(lines)
+
+        if any(w in ql for w in ["open incident","active incident","unresolved"]):
+            rows = db.query_incidents({"status": "open"}, limit=20)
+            if not rows: return "No open incidents — system is clean."
+            lines = [f"{len(rows)} open incident(s):"]
+            for i in rows: lines.append(inc_line(i))
+            return "\n".join(lines)
+
+        if any(w in ql for w in ["recent incident","latest incident","last incident",
+                                   "show incident","list incident","all incident"]):
+            rows = db.query_incidents(limit=10)
+            if not rows: return "No incidents found."
+            lines = [f"Last {len(rows)} incident(s):"]
+            for i in rows: lines.append(inc_line(i))
+            return "\n".join(lines)
+
+        # ── IP / user ─────────────────────────────────────────────────────────
+        if any(w in ql for w in ["ip","attacker","attacking","source"]):
+            incs = db.query_incidents(limit=1000)
+            ip_counts = {}
+            for i in incs:
+                ip = i.get("source_ip","")
+                if ip: ip_counts[ip] = ip_counts.get(ip, 0) + 1
+            if not ip_counts:
+                return "No source IPs recorded in incidents."
+            lines = ["Top attacking IPs:"]
+            for ip, cnt in sorted(ip_counts.items(), key=lambda x: -x[1])[:10]:
+                lines.append(f"  {cnt:>4}x  {ip}")
+            return "\n".join(lines)
+
+        if any(w in ql for w in ["user","account","affected"]):
+            incs = db.query_incidents(limit=1000)
+            usr_counts = {}
+            for i in incs:
+                u = i.get("affected_user","")
+                if u: usr_counts[u] = usr_counts.get(u, 0) + 1
+            if not usr_counts:
+                return "No affected users recorded in incidents."
+            lines = ["Affected users:"]
+            for u, cnt in sorted(usr_counts.items(), key=lambda x: -x[1])[:10]:
+                lines.append(f"  {cnt:>4}x  {u}")
+            return "\n".join(lines)
+
+        # ── logs ──────────────────────────────────────────────────────────────
+        if any(w in ql for w in ["auth log","auth logs","authentication"]):
+            rows = db.query_logs({"log_type": "auth"}, limit=10)
+            if not rows: return "No auth logs found."
+            lines = [f"Recent auth logs ({len(rows)}):"]
+            for r in rows:
+                lines.append(f"  [{fmt_time(r.get('timestamp',''))}] "
+                             f"{(r.get('process','') or '')[:14]}  "
+                             f"{(r.get('message','') or '')[:60]}")
+            return "\n".join(lines)
+
+        if any(w in ql for w in ["syslog","system log"]):
+            rows = db.query_logs({"log_type": "syslog"}, limit=10)
+            if not rows: return "No syslog entries found."
+            lines = [f"Recent syslog entries ({len(rows)}):"]
+            for r in rows:
+                lines.append(f"  [{fmt_time(r.get('timestamp',''))}] "
+                             f"{(r.get('process','') or '')[:14]}  "
+                             f"{(r.get('message','') or '')[:60]}")
+            return "\n".join(lines)
+
+        if any(w in ql for w in ["log","logs"]):
+            stats = db.get_log_stats()
+            by_type = stats.get("by_type", {})
+            parts = ", ".join(f"{k}: {v}" for k, v in by_type.items())
+            rows = db.query_logs(limit=5)
+            lines = [f"Log database (D1): {stats.get('total',0)} total entries",
+                     f"  Types: {parts or 'none'}",
+                     "  Recent:"]
+            for r in rows:
+                lines.append(f"    [{fmt_time(r.get('timestamp',''))}] "
+                             f"{(r.get('process','') or '')[:12]}  "
+                             f"{(r.get('message','') or '')[:55]}")
+            return "\n".join(lines)
+
+        # ── search ────────────────────────────────────────────────────────────
+        search_m = _re.search(r"search(?:\s+for)?\s+['\"]?([\w\s]+)['\"]?", ql)
+        if search_m:
+            kw = search_m.group(1).strip()
+            rows = db.query_logs({"keyword": kw}, limit=10)
+            if not rows: return f"No log entries matching '{kw}'."
+            lines = [f"Log entries matching '{kw}' ({len(rows)}):"]
+            for r in rows:
+                lines.append(f"  [{fmt_time(r.get('timestamp',''))}] "
+                             f"{(r.get('message','') or '')[:70]}")
+            return "\n".join(lines)
+
+        # ── audit trail ───────────────────────────────────────────────────────
+        if any(w in ql for w in ["audit","executed","command","action taken",
+                                   "what was done","remediat"]):
+            rows = db.query_audit(limit=10)
+            if not rows: return "No audit records found in D3."
+            lines = [f"Recent audit trail ({len(rows)} actions):"]
+            for r in rows:
+                ok = "✓" if r.get("success") else "✗"
+                lines.append(f"  {ok} [{fmt_time(r.get('executed_at',''))}]  "
+                             f"#{r.get('incident_id','?')}  {r.get('action_type','')}  "
+                             f"{(r.get('command','') or '')[:40]}")
+            return "\n".join(lines)
+
+        # ── status / overview ─────────────────────────────────────────────────
+        if any(w in ql for w in ["status","health","summary","overview","report",
+                                   "what's happening","whats happening"]):
+            incs  = db.query_incidents(limit=2000)
+            stats = db.get_log_stats()
+            open_ = [i for i in incs if i.get("status") == "open"]
+            crit  = [i for i in open_ if i.get("severity") == "critical"]
+            high  = [i for i in open_ if i.get("severity") == "high"]
+            audit = db.query_audit(limit=1)
+            lines = [
+                "System Security Summary:",
+                f"  Log entries    : {stats.get('total',0)}",
+                f"  Total incidents: {len(incs)}",
+                f"  Open incidents : {len(open_)}",
+                f"  Critical open  : {len(crit)}",
+                f"  High open      : {len(high)}",
+            ]
+            if crit:
+                lines.append("  ⚠ Active critical incidents:")
+                for i in crit[:3]:
+                    lines.append(f"    #{i.get('id')}  {i.get('threat_type','')}  "
+                                 f"IP={i.get('source_ip','—')}")
+            if audit:
+                lines.append(f"  Last action    : {audit[0].get('action_type','')} on "
+                             f"incident #{audit[0].get('incident_id','?')} at "
+                             f"{fmt_time(audit[0].get('executed_at',''))}")
+            return "\n".join(lines)
+
+        # ── fallback: keyword search across D1 + D2 ───────────────────────────
+        words = [w for w in ql.split() if len(w) > 3 and w not in
+                 ("show","list","what","when","where","tell","about","with",
+                  "have","does","there","that","this","from","were","been")]
+        if words:
+            kw = words[0]
+            rows = db.query_logs({"keyword": kw}, limit=5)
+            incs = [i for i in db.query_incidents(limit=500)
+                    if kw in (i.get("threat_type","") or "").lower()
+                    or kw in (i.get("description","") or "").lower()]
+            parts = []
+            if incs:
+                parts.append(f"Found {len(incs)} incident(s) related to '{kw}':")
+                for i in incs[:4]: parts.append(inc_line(i))
+            if rows:
+                parts.append(f"Found {len(rows)} log entry/entries matching '{kw}':")
+                for r in rows[:3]:
+                    parts.append(f"  [{fmt_time(r.get('timestamp',''))}] "
+                                 f"{(r.get('message','') or '')[:65]}")
+            if parts:
+                return "\n".join(parts)
+
+        return ("I didn't understand that. Click  '? Commands'  to see everything "
+                "I can answer, or type  help.")
 
     # ── Audit Page ────────────────────────────────────────────────────────────
 
