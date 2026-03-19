@@ -23,6 +23,7 @@ EVENT_PATTERNS = {
         r'Failed (?:password|publickey) for (?:invalid user )?'
         r'(?P<user>\S+) from (?P<ip>[\d.]+) port (?P<port>\d+)'
     ),
+    "root_login":    re.compile(r'(?:session opened for user root|Accepted (?:password|publickey) for root)'),
     "ssh_success":   re.compile(
         r'Accepted (?:password|publickey) for (?P<user>\S+) '
         r'from (?P<ip>[\d.]+) port (?P<port>\d+)'
@@ -31,7 +32,7 @@ EVENT_PATTERNS = {
         r'(?P<user>\S+)\s*:.*COMMAND=(?P<command>.+)$'
     ),
     "su_failed":     re.compile(
-        r'(?:FAILED su|authentication failure).*user=(?P<user>\S+)'
+        r'(?:FAILED su for \S+ by (?P<user>\S+)|authentication failure.*user=(?P<user2>\S+))'
     ),
     "new_user":      re.compile(r'new user: name=(?P<user>\S+)'),
     "passwd_change": re.compile(r'password changed for (?P<user>\S+)'),
@@ -39,10 +40,9 @@ EVENT_PATTERNS = {
     "session_close": re.compile(r'session closed for user (?P<user>\S+)'),
     "invalid_user":  re.compile(r'Invalid user (?P<user>\S+) from (?P<ip>[\d.]+)'),
     "cron_cmd":      re.compile(r'\((?P<user>\S+)\) CMD \((?P<command>.+)\)'),
-    "kernel_panic":  re.compile(r'kernel:.*(?:BUG|panic|Oops|segfault|oom-kill)'),
+    "kernel_panic":  re.compile(r'(?:kernel:.*)?(?:BUG|[Kk]ernel panic|Oops|segfault|oom-kill|Out of memory)'),
     "disk_error":    re.compile(r'(?:I/O error|EXT\d-fs error|disk failure)'),
     "port_scan":     re.compile(r'(?:nmap|masscan|SYN flood|port scan)'),
-    "root_login":    re.compile(r'session opened for user root'),
     "repeated_fail": re.compile(r'FAILED LOGIN \(3\)'),
 }
 
@@ -144,14 +144,23 @@ def parse_line(line: str, source: str) -> Optional[Dict]:
     except ValueError:
         ts = datetime.now().isoformat()
 
-    msg = g.get("message", "")
-    extra = {}
+    msg     = g.get("message", "")
+    process = g.get("process", "").strip().lower()
+    extra   = {}
+
+    # When process field IS "kernel", prepend so patterns fire correctly
+    search_text = f"kernel: {msg}" if process == "kernel" else msg
+
     for name, pat in EVENT_PATTERNS.items():
-        em = pat.search(msg)
+        em = pat.search(search_text)
         if em:
             extra["event_type"] = name
             try:
-                extra.update(em.groupdict())
+                gd = {k: v for k, v in em.groupdict().items() if v is not None}
+                # su_failed uses two named groups — normalise user2 -> user
+                if "user2" in gd:
+                    gd["user"] = gd.pop("user2")
+                extra.update(gd)
             except Exception:
                 pass
             break
