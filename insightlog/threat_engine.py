@@ -8,7 +8,34 @@ import threading
 from typing import Dict, Tuple
 from collections import defaultdict
 
+import os
+import pwd
 from insightlog import db_manager as db
+
+def _get_protected_users() -> set:
+    """
+    Returns usernames that must never be locked, deleted, or modified.
+    Includes: current operator, root, and any user in the sudo/wheel group.
+    """
+    protected = {"root"}
+    # whoever is running the daemon / GUI
+    try:
+        protected.add(os.environ.get("SUDO_USER", ""))
+        protected.add(pwd.getpwuid(os.getuid()).pw_name)
+        protected.add(pwd.getpwuid(os.geteuid()).pw_name)
+    except Exception:
+        pass
+    # all members of sudo and wheel groups
+    try:
+        import grp
+        for grp_name in ("sudo", "wheel", "admin"):
+            try:
+                protected.update(grp.getgrnam(grp_name).gr_mem)
+            except KeyError:
+                pass
+    except Exception:
+        pass
+    return {u for u in protected if u}  # drop empty strings
 
 RULES = [
     {
@@ -163,10 +190,19 @@ def suggest_actions(incident: dict) -> list:
     ip   = incident.get("source_ip", "")
     user = incident.get("affected_user", "")
 
+    # Safety: never suggest locking or deleting a protected system/operator account
+    protected = _get_protected_users()
+    if user and user in protected:
+        user_lock   = f"# SAFETY: '{user}' is a protected account — do not lock automatically"
+        user_delete = f"# SAFETY: '{user}' is a protected account — do not delete automatically"
+    else:
+        user_lock   = f"passwd -l {user}" if user else "# No user identified — audit accounts manually"
+        user_delete = f"userdel -r {user}" if user else "# No user identified — check /etc/passwd manually"
+
     suggestions = {
         "SSH Brute Force": [
             f"iptables -A INPUT -s {ip} -j DROP"                                         if ip   else "# No source IP — identify attacker manually",
-            f"passwd -l {user}"                                                           if user else "# No user identified — audit SSH accounts",
+            user_lock if user else "# No user identified — audit SSH accounts",
             "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && systemctl restart ssh",
             "systemctl enable --now fail2ban",
         ],
@@ -181,17 +217,17 @@ def suggest_actions(incident: dict) -> list:
             "# Manual: enforce sudo usage — ensure wheel/sudo group is configured",
         ],
         "Privilege Escalation Failed": [
-            f"passwd -l {user}"                                                           if user else "# No user identified — audit sudoers manually",
+            user_lock if user else "# No user identified — audit sudoers manually",
             "cat /etc/sudoers",
             "last | head -20",
         ],
         "Unexpected New User Created": [
-            f"userdel -r {user}"                                                          if user else "# No user identified — check /etc/passwd manually",
+            user_delete if user else "# No user identified — check /etc/passwd manually",
             "cat /etc/passwd | tail -10",
             "last | head -10",
         ],
         "Password Change": [
-            f"passwd -l {user}"                                                           if user else "# No user identified — review recent password changes",
+            user_lock if user else "# No user identified — review recent password changes",
             "last | head -10",
             "# Manual: verify the password change was authorized",
         ],

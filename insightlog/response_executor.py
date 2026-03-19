@@ -5,8 +5,34 @@ Executes approved remediation commands and logs to D3
 import subprocess
 import shlex
 import os
+import pwd
 
 from insightlog import db_manager as db
+
+
+def _get_protected_users() -> set:
+    """Users that must never be targeted by destructive commands."""
+    protected = {"root"}
+    try:
+        protected.add(os.environ.get("SUDO_USER", ""))
+        protected.add(pwd.getpwuid(os.getuid()).pw_name)
+        protected.add(pwd.getpwuid(os.geteuid()).pw_name)
+    except Exception:
+        pass
+    try:
+        import grp
+        for grp_name in ("sudo", "wheel", "admin"):
+            try:
+                protected.update(grp.getgrnam(grp_name).gr_mem)
+            except KeyError:
+                pass
+    except Exception:
+        pass
+    return {u for u in protected if u}
+
+
+# Commands that modify or delete a user — require extra safety check
+_DESTRUCTIVE_USER_CMDS = {"passwd", "userdel", "usermod", "chpasswd"}
 
 SAFE_COMMANDS = [
     "iptables", "ufw", "passwd", "userdel", "usermod",
@@ -42,6 +68,34 @@ def execute_action(incident_id: int, command: str,
             "success":     0,
         })
         return {"success": False, "result": result_text}
+
+    # Safety: block destructive commands targeting protected users
+    try:
+        parts = shlex.split(command)
+        cmd_name = os.path.basename(parts[0]) if parts else ""
+        if cmd_name in _DESTRUCTIVE_USER_CMDS:
+            # Find the target username — last non-flag argument
+            target = next(
+                (p for p in reversed(parts[1:]) if not p.startswith("-")),
+                None
+            )
+            if target and target in _get_protected_users():
+                result_text = (
+                    f"BLOCKED: '{command}' targets protected account '{target}'. "
+                    f"This account belongs to the system operator or a sudo group member "
+                    f"and cannot be modified automatically."
+                )
+                db.insert_audit({
+                    "incident_id": incident_id,
+                    "action_type": "blocked_safety",
+                    "command":     command,
+                    "result":      result_text,
+                    "approved_by": approved_by,
+                    "success":     0,
+                })
+                return {"success": False, "result": result_text}
+    except Exception:
+        pass
 
     try:
         proc = subprocess.run(
