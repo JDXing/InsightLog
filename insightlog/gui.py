@@ -220,6 +220,69 @@ def is_safe_cmd(cmd):
 
 
 
+def _friendly_label(action: str) -> str:
+    """Convert a raw shell command or comment into a short plain-English label."""
+    if action.startswith("#"):
+        return action.lstrip("# ").strip()
+    cmd = action.strip()
+    # Common patterns → plain English
+    patterns = [
+        (r"iptables.*-j DROP",            "Block attacking IP with firewall"),
+        (r"iptables",                      "Update firewall rules"),
+        (r"ufw enable",                    "Enable firewall (UFW)"),
+        (r"ufw",                           "Update firewall (UFW)"),
+        (r"passwd -l",                     "Lock the affected user account"),
+        (r"passwd",                        "Change user password"),
+        (r"userdel",                       "Delete the suspicious user account"),
+        (r"usermod",                       "Modify user account settings"),
+        (r"PasswordAuthentication no",     "Disable SSH password login (keys only)"),
+        (r"PermitRootLogin no",            "Disable direct root SSH login"),
+        (r"sshd_config.*AllowUsers",       "Restrict SSH to allowed users only"),
+        (r"systemctl.*restart ssh",        "Restart SSH service"),
+        (r"systemctl.*fail2ban",           "Enable auto-brute-force protection"),
+        (r"systemctl",                     "Manage a system service"),
+        (r"fail2ban-client",               "Configure brute-force protection"),
+        (r"pkill|kill ",                   "Stop the suspicious process"),
+        (r"last\b",                        "Show recent login history"),
+        (r"who\b",                         "Show who is currently logged in"),
+        (r"ss -|netstat",                  "Show open network connections"),
+        (r"journalctl.*kernel|journalctl.*-k", "Show kernel/system log messages"),
+        (r"journalctl",                    "Show system log messages"),
+        (r"smartctl",                      "Run disk health check"),
+        (r"fsck",                          "Check and repair filesystem"),
+        (r"free -",                        "Check available memory"),
+        (r"vmstat",                        "Show system performance stats"),
+        (r"cat /etc/passwd",               "Review user accounts list"),
+        (r"cat /etc/sudoers",              "Review sudo permissions"),
+        (r"sed.*sshd_config",              "Update SSH server configuration"),
+    ]
+    import re as _re
+    for pattern, label in patterns:
+        if _re.search(pattern, cmd):
+            return label
+    # Fallback: use the first meaningful word of the command
+    first = cmd.split()[0].split("/")[-1] if cmd.split() else cmd
+    return f"Run: {first}"
+
+
+def _get_executed_cmds(inc_id: int) -> set:
+    """
+    Query D3 audit log and return the set of commands that were already
+    successfully executed for this incident. Used to restore green button
+    state when a dialog is reopened.
+    """
+    try:
+        rows = db.query_audit(incident_id=inc_id, limit=200)
+        return {
+            r["command"]
+            for r in rows
+            if r.get("success") and r.get("action_type") == "execute"
+               and r.get("command")
+        }
+    except Exception:
+        return set()
+
+
 def make_readonly(widget):
     """Allow select/copy but block typing, paste, delete."""
     def _guard(e):
@@ -332,26 +395,48 @@ class RespondDialog(tk.Toplevel):
         tk.Label(body, text="SUGGESTED ACTIONS", bg=C["bg"], fg=C["accent"],
                  font=("Courier New", 9, "bold")).pack(anchor="w", pady=(0, 6))
 
+        self._action_buttons = {}   # cmd -> button widget
+        already_done = _get_executed_cmds(self.inc_id)
         for i, action in enumerate(self.actions):
             is_manual = action.startswith("#")
             cmd_text  = action.lstrip("# ") if is_manual else action
+            friendly  = _friendly_label(action)
             f = tk.Frame(body, bg=C["bg3"],
                          highlightbackground=C["border"], highlightthickness=1)
             f.pack(fill="x", pady=3)
-            # Pack button/label on right FIRST so it gets priority in layout
             if not is_manual:
-                StyledButton(f, "Execute",
+                done = cmd_text in already_done
+                btn = StyledButton(f,
+                    "✓ Executed" if done else "Execute",
                     command=lambda c=cmd_text: self._confirm_execute(c),
-                    style="danger", width=9).pack(side="right", padx=6, pady=4)
+                    style="danger", width=9)
+                if done:
+                    btn.config(
+                        bg=C["green"], fg=C["bg"],
+                        activebackground=C["green"],
+                        state="disabled", cursor="arrow"
+                    )
+                btn.pack(side="right", padx=6, pady=4)
+                self._action_buttons[cmd_text] = btn
             else:
                 tk.Label(f, text="Manual", bg=C["bg3"], fg=C["subtext"],
                          font=("Courier New", 8), width=9, anchor="center").pack(side="right", padx=6, pady=4)
             tk.Label(f, text=f"  {i+1}.", bg=C["bg3"], fg=C["subtext"],
                      font=("Courier New", 9), width=4).pack(side="left")
-            tk.Label(f, text=action[:55],
-                     bg=C["bg3"], fg=C["subtext"] if is_manual else C["text"],
-                     font=("Courier New", 9, "italic" if is_manual else "normal"),
-                     anchor="w").pack(side="left", fill="x", expand=True, padx=4)
+            # Show friendly label on top, raw command smaller below
+            lbl_frame = tk.Frame(f, bg=C["bg3"])
+            lbl_frame.pack(side="left", fill="x", expand=True, padx=4, pady=3)
+            tk.Label(lbl_frame,
+                     text=friendly,
+                     bg=C["bg3"], fg=C["subtext"] if is_manual else C["white"],
+                     font=("Courier New", 9, "italic" if is_manual else "bold"),
+                     anchor="w").pack(anchor="w")
+            if not is_manual:
+                tk.Label(lbl_frame,
+                         text=cmd_text[:72],
+                         bg=C["bg3"], fg=C["subtext"],
+                         font=("Courier New", 7),
+                         anchor="w").pack(anchor="w")
 
         tk.Label(body, text="CUSTOM COMMAND", bg=C["bg"], fg=C["accent"],
                  font=("Courier New", 9, "bold")).pack(anchor="w", pady=(14, 6))
@@ -405,7 +490,6 @@ class RespondDialog(tk.Toplevel):
         # Check if the primary executable exists before running
         try:
             primary = cmd.strip().split()[0].split("&&")[0].strip()
-            # For compound commands, get first actual binary
             for token in cmd.replace("&&", " ").replace("|", " ").split():
                 if not token.startswith("-") and "=" not in token:
                     primary = token
@@ -418,7 +502,6 @@ class RespondDialog(tk.Toplevel):
         except Exception:
             pass
         try:
-            # Use bash -c so &&, pipes, and compound commands work correctly
             proc = subprocess.run(
                 ["bash", "-c", cmd], capture_output=True, text=True, timeout=30)
             out     = (proc.stdout + proc.stderr).strip()
@@ -432,6 +515,15 @@ class RespondDialog(tk.Toplevel):
                 "approved_by": "operator",
                 "success":     1 if success else 0,
             })
+            # Mark button green + disabled on success
+            if success and cmd in self._action_buttons:
+                btn = self._action_buttons[cmd]
+                btn.config(
+                    text="✓ Executed",
+                    bg=C["green"], fg=C["bg"],
+                    activebackground=C["green"],
+                    state="disabled", cursor="arrow"
+                )
         except subprocess.TimeoutExpired:
             self._log_output("Command timed out after 30s.")
         except Exception as e:
@@ -1748,26 +1840,47 @@ class InsightLogApp(tk.Tk):
         for w in self._suggest_frame.winfo_children():
             w.destroy()
 
+        self._respond_action_buttons = {}   # cmd -> button widget
+        already_done = _get_executed_cmds(inc_id)
         for i, action in enumerate(suggest_actions(inc)):
             is_manual = action.startswith("#")
             cmd       = action.lstrip("# ") if is_manual else action
+            friendly  = _friendly_label(action)
             f   = tk.Frame(self._suggest_frame, bg=C["bg3"],
                            highlightbackground=C["border"], highlightthickness=1)
             f.pack(fill="x", pady=2)
-            # Pack button/label on right FIRST so it gets priority in layout
             if not is_manual:
-                StyledButton(f, "Execute",
+                done = cmd in already_done
+                btn = StyledButton(f,
+                    "✓ Executed" if done else "Execute",
                     command=lambda c=cmd: self._respond_page_execute(c),
-                    style="danger", width=9).pack(side="right", padx=6, pady=3)
+                    style="danger", width=9)
+                if done:
+                    btn.config(
+                        bg=C["green"], fg=C["bg"],
+                        activebackground=C["green"],
+                        state="disabled", cursor="arrow"
+                    )
+                btn.pack(side="right", padx=6, pady=3)
+                self._respond_action_buttons[cmd] = btn
             else:
                 tk.Label(f, text="Manual", bg=C["bg3"], fg=C["subtext"],
                          font=("Courier New", 8), width=9, anchor="center").pack(side="right", padx=6, pady=3)
             tk.Label(f, text=f" {i+1}.", bg=C["bg3"], fg=C["subtext"],
                      font=("Courier New", 9), width=3).pack(side="left")
-            tk.Label(f, text=action[:60],
-                     bg=C["bg3"], fg=C["subtext"] if is_manual else C["text"],
-                     font=("Courier New", 9, "italic" if is_manual else "normal"),
-                     anchor="w").pack(side="left", fill="x", expand=True, padx=4)
+            lbl_frame = tk.Frame(f, bg=C["bg3"])
+            lbl_frame.pack(side="left", fill="x", expand=True, padx=4, pady=3)
+            tk.Label(lbl_frame,
+                     text=friendly,
+                     bg=C["bg3"], fg=C["subtext"] if is_manual else C["white"],
+                     font=("Courier New", 9, "italic" if is_manual else "bold"),
+                     anchor="w").pack(anchor="w")
+            if not is_manual:
+                tk.Label(lbl_frame,
+                         text=cmd[:72],
+                         bg=C["bg3"], fg=C["subtext"],
+                         font=("Courier New", 7),
+                         anchor="w").pack(anchor="w")
 
     def _respond_page_execute(self, cmd):
         if not self._current_respond_inc:
@@ -1778,7 +1891,8 @@ class InsightLogApp(tk.Tk):
         self._respond_log(f"$ {cmd}")
         try:
             proc = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=30)
-            out  = (proc.stdout + proc.stderr).strip()
+            out     = (proc.stdout + proc.stderr).strip()
+            success = proc.returncode == 0
             self._respond_log(out or "(no output)")
             db.insert_audit({
                 "incident_id": self._current_respond_inc,
@@ -1786,8 +1900,18 @@ class InsightLogApp(tk.Tk):
                 "command":     cmd,
                 "result":      out[:2000],
                 "approved_by": "operator",
-                "success":     1 if proc.returncode == 0 else 0,
+                "success":     1 if success else 0,
             })
+            # Mark button green + disabled on success
+            if success and hasattr(self, "_respond_action_buttons"):
+                btn = self._respond_action_buttons.get(cmd)
+                if btn:
+                    btn.config(
+                        text="✓ Executed",
+                        bg=C["green"], fg=C["bg"],
+                        activebackground=C["green"],
+                        state="disabled", cursor="arrow"
+                    )
         except Exception as e:
             self._respond_log(f"Error: {e}")
 
